@@ -172,7 +172,7 @@ class PRISMTrainer:
         ))
 
         # ---- Layer 2: XGBRegressor ----
-        results.append(self._train_layer2_regressor(
+        results.append(self._train_layer2_magnitude(
             X_train, X_test, y_train_reg, y_test_reg, X_train_df, feature_cols
         ))
 
@@ -293,7 +293,7 @@ class PRISMTrainer:
             overfit_flag=overfit,
         )
 
-    def _train_layer2_regressor(
+    def _train_layer2_magnitude(
         self, X_train, X_test, y_train, y_test, X_df, feature_cols
     ) -> TrainingResult:
         logger.info("Training Layer 2 — XGBRegressor (magnitude pips)")

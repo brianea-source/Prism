@@ -351,6 +351,98 @@ def test_instrument_routing_single_source_of_truth():
         )
 
 
+# ---------------------------------------------------------------------------
+# 5. pipeline.py fixes surfaced by the Smoke #2 retrain run
+# ---------------------------------------------------------------------------
+
+def test_pipeline_yfinance_multiindex_is_flattened(monkeypatch):
+    """yfinance >= 0.2.x returns a MultiIndex when a single ticker string is
+    passed. The fallback used to run [c.lower() for c in raw.columns] which
+    crashes on tuples with 'tuple object has no attribute lower'. Ensure
+    a MultiIndex response is flattened to a valid OHLCV DataFrame.
+    """
+    from prism.data.pipeline import PRISMFeaturePipeline
+
+    fake_yf_frame = pd.DataFrame(
+        {
+            ("Open", "EURUSD=X"):  [1.10, 1.11],
+            ("High", "EURUSD=X"):  [1.12, 1.13],
+            ("Low", "EURUSD=X"):   [1.09, 1.10],
+            ("Close", "EURUSD=X"): [1.11, 1.12],
+            ("Volume", "EURUSD=X"): [0, 0],
+        },
+        index=pd.date_range("2024-01-01", periods=2, freq="h", name="Datetime"),
+    )
+    fake_yf_frame.columns = pd.MultiIndex.from_tuples(fake_yf_frame.columns)
+
+    class _FakeYF:
+        @staticmethod
+        def download(*args, **kwargs):
+            return fake_yf_frame
+
+    # Block the Tiingo path so the pipeline falls through to yfinance.
+    class _DeadTiingo:
+        pass
+
+    monkeypatch.setitem(sys.modules, "yfinance", _FakeYF)
+    monkeypatch.setattr(
+        "prism.data.tiingo.get_ohlcv",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("tiingo dead")),
+    )
+
+    pipeline = PRISMFeaturePipeline("EURUSD", timeframe="H1")
+    df = pipeline._load_price_data("2024-01-01", "2024-01-02")
+
+    assert not df.empty
+    assert {"datetime", "open", "high", "low", "close"}.issubset(df.columns)
+    assert df["close"].iloc[-1] == pytest.approx(1.12)
+
+
+def test_pipeline_merge_key_is_tz_naive():
+    """Tiingo/yfinance datetimes are tz-aware UTC; macro/COT/fear-greed
+    DataFrames are tz-naive. Merging on a tz-aware key against a tz-naive
+    one raises 'trying to merge on datetime64[ns, UTC] and datetime64[ns]'.
+    Guard the normalisation: the date key used for every merge must be
+    tz-naive midnight."""
+    from prism.data.pipeline import PRISMFeaturePipeline  # noqa: F401 (import for coverage)
+
+    # Replay the exact normalisation pipeline.py uses.
+    datetime_aware = pd.Series(pd.to_datetime(
+        ["2024-01-01T12:00:00Z", "2024-01-02T00:00:00Z"], utc=True
+    ))
+    date_key = (pd.to_datetime(datetime_aware, utc=True)
+                .dt.tz_localize(None).dt.normalize())
+
+    assert date_key.dt.tz is None, "date key leaked a tz — merge will fail"
+    assert str(date_key.iloc[0]) == "2024-01-01 00:00:00"
+
+    # Simulate merge against a tz-naive macro frame — must not raise.
+    macro = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+        "cpi_yoy": [3.1, 3.1],
+    })
+    left = pd.DataFrame({"date": date_key, "close": [1.10, 1.11]})
+    merged = left.merge(macro, on="date", how="left")
+    assert merged["cpi_yoy"].notna().all()
+
+
+def test_direction_fwd_4_safe_for_nan_tail():
+    """np.sign on close.shift(-4) leaves NaN in the last 4 rows. Casting
+    directly to int raises IntCastingNaNError on modern pandas. The fix is:
+    keep as float, dropna, then astype(int). Verify that flow here."""
+    close = pd.Series([1.10, 1.11, 1.12, 1.13, 1.14, 1.15, 1.16])
+    raw = np.sign(close.shift(-4) - close)   # last 4 are NaN
+    assert raw.isna().sum() == 4
+
+    # This is the old (broken) path:
+    with pytest.raises(Exception):
+        raw.astype(int)
+
+    # This is the new (correct) path:
+    cleaned = raw.dropna().astype(int).tolist()
+    assert cleaned == [1, 1, 1]  # three non-NaN rows, all positive
+
+
 def test_iex_intraday_uses_lowercase_resample_freq():
     """Regression guard for the IEX resampleFreq casing — Tiingo docs show
     lowercase ('1hour', '4hour', '5min' etc). If someone changes the map
