@@ -58,8 +58,17 @@ class SlackNotifier:
         tp_dist = abs(tp - entry)
         return round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0.0
 
-    def _format_signal_blocks(self, signal: SignalPacket) -> list:
-        """Build Slack Block Kit payload for a signal."""
+    def _format_signal_blocks(
+        self, signal: SignalPacket, demo_warning: Optional[str] = None
+    ) -> list:
+        """
+        Build Slack Block Kit payload for a signal.
+
+        demo_warning: optional human-readable string rendered as a highlighted
+        warning block at the TOP of the message. Used when the runner is
+        feeding aliased data (e.g. H4 bars as M5) so Brian can't miss the
+        context while reviewing an approval.
+        """
         pip = self._pip_size(signal.instrument)
         sl_pips = abs(signal.entry - signal.sl) / pip
         rr1 = self._calc_rr(signal.entry, signal.sl, signal.tp1)
@@ -100,37 +109,60 @@ class SlackNotifier:
         if fvg_str:
             body_lines.append(f":package: *FVG Zone:*        {fvg_str}")
 
+        # Show a short, human-scannable signal_id so Slack audit ↔ MT5 comment
+        # ↔ server logs reconcile without copy-pasting a full UUID.
+        short_id = (getattr(signal, "signal_id", "") or "")[:8] or "n/a"
+
         body_lines += [
             f"{regime_emoji} *Regime:*          {signal.regime} - News: {signal.news_bias}",
             f":clock1: *Session:*         {session_str}",
             "",
             f"_Conf: {signal.confidence:.2f} - Mag: ~{signal.magnitude_pips:.0f} pips - {signal.model_version}_",
-            f"_Signal time: {signal_time}_",
+            f"_Signal: `#{short_id}`  -  {signal_time}_",
         ]
 
         body = "\n".join(body_lines)
 
-        blocks = [
+        blocks: list = []
+        if demo_warning:
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f":warning: *DEMO MODE* — {demo_warning}",
+                },
+            })
+            blocks.append({"type": "divider"})
+
+        blocks.extend([
             {
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": body},
             },
             {"type": "divider"},
-        ]
+        ])
         return blocks
 
     def _format_confirm_blocks(
-        self, signal: SignalPacket, message_ts: str, use_buttons: bool = True
+        self,
+        signal: SignalPacket,
+        message_ts: str,
+        use_buttons: bool = False,
+        demo_warning: Optional[str] = None,
     ) -> list:
         """
         Build confirmation blocks below the signal.
 
-        use_buttons=True  → Slack action buttons (Phase 4 webhook mode).
-        use_buttons=False → Reaction instructions context block (Phase 3 poll mode).
-                            PollConfirmHandler watches for ✅/❌ reactions; buttons
-                            would do nothing in that flow.
+        use_buttons=False (default) → Reaction instructions context block
+                                       (Phase 3 poll mode). PollConfirmHandler
+                                       watches for ✅/❌ reactions; buttons
+                                       would do nothing in that flow.
+        use_buttons=True             → Slack action buttons (Phase 4 webhook).
+
+        demo_warning: forwarded to _format_signal_blocks; surfaces a big warning
+        block at the top when the runner is scanning on aliased data.
         """
-        blocks = self._format_signal_blocks(signal)
+        blocks = self._format_signal_blocks(signal, demo_warning=demo_warning)
         timeout_min = self.confirm_timeout_sec // 60
 
         if use_buttons:
@@ -173,7 +205,7 @@ class SlackNotifier:
                         "type": "mrkdwn",
                         "text": (
                             f":timer_clock: React :white_check_mark: to confirm "
-                            f"or :x: to skip (auto-expires in {timeout_min} min)"
+                            f"or :x: to skip (auto-expires in {timeout_min} minutes)"
                         ),
                     }
                 ],
@@ -186,6 +218,7 @@ class SlackNotifier:
         signal: SignalPacket,
         mode: str = "CONFIRM",
         use_buttons: bool = False,
+        demo_warning: Optional[str] = None,
     ) -> Optional[str]:
         """
         Send signal to Slack.
@@ -198,6 +231,11 @@ class SlackNotifier:
                                PollConfirmHandler monitors emoji reactions.
             True            -- Phase 4 webhook mode: render action buttons.
 
+        demo_warning: when set, prepends a highlighted ":warning: DEMO MODE"
+            section to the message. Use this whenever the runner is feeding
+            aliased or simulated data so Brian cannot mistake it for a live
+            M5/M15-driven signal.
+
         Returns message_ts (used to update the message on confirmation/expiry).
         """
         if not self.client:
@@ -206,9 +244,13 @@ class SlackNotifier:
 
         try:
             if mode == "CONFIRM":
-                blocks = self._format_confirm_blocks(signal, "pending", use_buttons=use_buttons)
+                blocks = self._format_confirm_blocks(
+                    signal, "pending",
+                    use_buttons=use_buttons,
+                    demo_warning=demo_warning,
+                )
             else:
-                blocks = self._format_signal_blocks(signal)
+                blocks = self._format_signal_blocks(signal, demo_warning=demo_warning)
 
             resp = self.client.chat_postMessage(
                 channel=self.channel,
@@ -220,7 +262,11 @@ class SlackNotifier:
 
             # Re-stamp the message with the real ts so any block references are correct.
             if mode == "CONFIRM":
-                updated_blocks = self._format_confirm_blocks(signal, ts, use_buttons=use_buttons)
+                updated_blocks = self._format_confirm_blocks(
+                    signal, ts,
+                    use_buttons=use_buttons,
+                    demo_warning=demo_warning,
+                )
                 self.client.chat_update(
                     channel=self.channel,
                     ts=ts,

@@ -12,7 +12,6 @@ Flow:
 This module runs on every new M5/M15 bar.
 """
 import logging
-import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -144,6 +143,7 @@ class SignalGenerator:
             f"tp1={tp1} tp2={tp2} rr={rr:.2f} conf={confidence:.2f}"
         )
 
+        # signal_id is auto-assigned via dataclass default_factory (uuid4).
         packet = SignalPacket(
             instrument=self.instrument,
             direction=direction_str,
@@ -160,7 +160,6 @@ class SignalGenerator:
             fvg_zone=vars(fvg_zone),
             signal_time=datetime.now(timezone.utc).isoformat(),
         )
-        packet.signal_id = str(uuid.uuid4())
         return packet
 
     def _calculate_levels(

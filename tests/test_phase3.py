@@ -154,9 +154,12 @@ class TestSlackNotifier:
         notifier.update_signal_status("fake_ts", "EXECUTED", signal)  # type: ignore[arg-type]
 
     def test_slack_notifier_confirm_blocks_has_actions(self):
+        # Phase 3 defaults _format_confirm_blocks to poll mode (no buttons);
+        # this test covers the Phase 4 webhook variant that still needs an
+        # "actions" block with approve/skip buttons.
         notifier = self._make_notifier()
         signal = MockSignalPacket()
-        blocks = notifier._format_confirm_blocks(signal, "pending")  # type: ignore[arg-type]
+        blocks = notifier._format_confirm_blocks(signal, "pending", use_buttons=True)  # type: ignore[arg-type]
         types = [b["type"] for b in blocks]
         assert "actions" in types
 
