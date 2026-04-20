@@ -8,7 +8,7 @@ Slack Interactivity requires a public endpoint (ngrok or VPS URL).
 """
 import logging
 import time as time_module
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -25,27 +25,60 @@ class PollConfirmHandler:
     Fallback approach when Slack Interactivity endpoint is not set up yet.
 
     Usage:
-        handler = PollConfirmHandler(slack_client, channel, message_ts)
+        handler = PollConfirmHandler(
+            slack_client, channel, message_ts,
+            approvers={"U012ABC", "U345DEF"},  # optional allow-list
+        )
         result = handler.wait(timeout_sec=300)
         # result: "CONFIRMED", "SKIPPED", or "EXPIRED"
+
+    Authorisation:
+        If ``approvers`` is provided and non-empty, only reactions from users in
+        that set count. Reactions from anyone else (including Slack bots that
+        auto-react, or channel members who aren't on the trading desk) are
+        ignored. If ``approvers`` is None or empty, any reactor is accepted —
+        keep the allow-list set in production.
     """
 
     CONFIRM_REACTION = "white_check_mark"   # checkmark emoji
     SKIP_REACTION = "x"                     # x emoji
 
-    def __init__(self, client, channel: str, message_ts: str):
+    def __init__(
+        self,
+        client,
+        channel: str,
+        message_ts: str,
+        approvers: Optional[Iterable[str]] = None,
+    ):
         self.client = client
         self.channel = channel
         self.message_ts = message_ts
+        # Normalise to a set of non-empty user IDs; treat empty iterable as None
+        # so callers can pass ``os.environ.get("PRISM_APPROVERS","").split(",")``
+        # without having to filter beforehand.
+        self.approvers: Optional[Set[str]] = None
+        if approvers:
+            filtered = {u.strip() for u in approvers if u and u.strip()}
+            self.approvers = filtered or None
+
+    def _reaction_from_approver(self, reaction: dict) -> bool:
+        """Return True if this reaction counts per the approver allow-list."""
+        if not self.approvers:
+            return True
+        users = reaction.get("users") or []
+        return any(u in self.approvers for u in users)
 
     def wait(self, timeout_sec: int = 300, poll_interval_sec: int = 10) -> str:
         """
-        Block until confirm or skip reaction is added, or until timeout.
+        Block until an authorised confirm/skip reaction is added, or timeout.
         Returns a ConfirmationResult constant.
         """
         deadline = time_module.time() + timeout_sec
         logger.info(
-            f"Waiting for confirmation on ts={self.message_ts} (timeout={timeout_sec}s)"
+            "Waiting for confirmation on ts=%s (timeout=%ds, approvers=%s)",
+            self.message_ts,
+            timeout_sec,
+            "any" if not self.approvers else sorted(self.approvers),
         )
 
         while time_module.time() < deadline:
@@ -53,13 +86,14 @@ class PollConfirmHandler:
                 resp = self.client.reactions_get(
                     channel=self.channel,
                     timestamp=self.message_ts,
+                    full=True,  # ensure ``users`` list is populated
                 )
                 reactions = resp.get("message", {}).get("reactions", [])
                 for r in reactions:
-                    if r["name"] == self.CONFIRM_REACTION:
+                    if r["name"] == self.CONFIRM_REACTION and self._reaction_from_approver(r):
                         logger.info("Signal CONFIRMED via reaction")
                         return ConfirmationResult.CONFIRMED
-                    if r["name"] == self.SKIP_REACTION:
+                    if r["name"] == self.SKIP_REACTION and self._reaction_from_approver(r):
                         logger.info("Signal SKIPPED via reaction")
                         return ConfirmationResult.SKIPPED
             except Exception as exc:
