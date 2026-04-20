@@ -1,0 +1,49 @@
+# PRISM Instrument Configuration
+instruments:
+  XAUUSD:
+    phase: 1
+    pip_value: 0.01
+    min_sl_pips: 500    # $5 minimum SL
+    atr_multiplier: 1.5
+    tp1_multiplier: 1.5
+    tp2_multiplier: 3.0
+    max_lot: 0.10
+    session_filter: ["london", "ny", "overlap"]
+
+  EURUSD:
+    phase: 1
+    pip_value: 0.0001
+    min_sl_pips: 10
+    atr_multiplier: 1.5
+    tp1_multiplier: 1.5
+    tp2_multiplier: 3.0
+    max_lot: 1.00
+    session_filter: ["london", "ny", "overlap"]
+
+  GBPUSD:
+    phase: 1
+    pip_value: 0.0001
+    min_sl_pips: 12
+    atr_multiplier: 1.5
+    tp1_multiplier: 1.5
+    tp2_multiplier: 3.0
+    max_lot: 1.00
+    session_filter: ["london", "ny", "overlap"]
+
+  USDJPY:
+    phase: 2
+    pip_value: 0.01
+    min_sl_pips: 10
+    atr_multiplier: 1.5
+    tp1_multiplier: 2.0
+    tp2_multiplier: 3.0
+    max_lot: 1.00
+    session_filter: ["tokyo", "london", "overlap"]
+
+risk:
+  account_risk_pct: 1.0       # 1% per trade
+  max_concurrent_trades: 3
+  max_currency_exposure_pct: 2.0
+  session_drawdown_kill_pct: 5.0
+  min_rr_ratio: 1.5
+  min_confidence: 0.60
