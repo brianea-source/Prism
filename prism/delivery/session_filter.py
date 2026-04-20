@@ -6,7 +6,8 @@ Kill zones:
 - London: 07:00 – 11:00 UTC
 - New York: 13:00 – 17:00 UTC
 - Asian: SKIP (low liquidity, avoid)
-- London/NY Overlap: 13:00 – 15:00 UTC (highest probability)
+
+London and NY kill zones do not overlap (gap 11:00–13:00 UTC).
 """
 from datetime import datetime, time, timezone
 from enum import Enum
@@ -15,7 +16,6 @@ from enum import Enum
 class Session(str, Enum):
     LONDON = "London"
     NEW_YORK = "New York"
-    LONDON_NY_OVERLAP = "London/NY Overlap"
     ASIAN = "Asian"
     OFF = "Off-session"
 
@@ -30,14 +30,25 @@ ASIAN_END = time(6, 0)
 
 
 def get_current_session(dt: datetime = None) -> Session:
-    """Return the active trading session for a given UTC datetime."""
+    """
+    Return the active trading session for a given UTC datetime.
+
+    Parameters
+    ----------
+    dt : datetime, optional
+        A **timezone-aware** datetime. If omitted, ``datetime.now(timezone.utc)``
+        is used. Passing a naive datetime raises ``ValueError`` — always pass
+        tz-aware values (e.g. ``datetime.now(timezone.utc)`` or any
+        ``pytz``/``zoneinfo`` aware object).
+    """
     if dt is None:
         dt = datetime.now(timezone.utc)
-    t = dt.time().replace(tzinfo=None)
-
-    # London/NY overlap: 13:00-15:00 UTC (both London and NY open)
-    if NY_START <= t < time(15, 0) and LONDON_START <= t < LONDON_END:
-        return Session.LONDON_NY_OVERLAP
+    if dt.tzinfo is None:
+        raise ValueError(
+            "get_current_session requires a tz-aware datetime (use timezone.utc)"
+        )
+    # Normalise to UTC before extracting wall-clock time
+    t = dt.astimezone(timezone.utc).time().replace(tzinfo=None)
 
     # New York: 13:00-17:00 UTC
     if NY_START <= t < NY_END:
@@ -60,7 +71,7 @@ def is_kill_zone(dt: datetime = None) -> bool:
     PRISM only fires signals during kill zones (per ICC rules).
     """
     session = get_current_session(dt)
-    return session in (Session.LONDON, Session.NEW_YORK, Session.LONDON_NY_OVERLAP)
+    return session in (Session.LONDON, Session.NEW_YORK)
 
 
 def session_label(dt: datetime = None) -> str:
@@ -68,7 +79,7 @@ def session_label(dt: datetime = None) -> str:
     if dt is None:
         dt = datetime.now(timezone.utc)
     session = get_current_session(dt)
-    time_str = dt.strftime("%H:%M") + " UTC"
+    time_str = dt.astimezone(timezone.utc).strftime("%H:%M") + " UTC"
     if session == Session.OFF:
         return f"Off-session ({time_str})"
     return f"{session.value} Kill Zone ({time_str})"

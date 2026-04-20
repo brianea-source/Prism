@@ -24,16 +24,10 @@ from typing import Optional
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from prism.execution.mt5_bridge import SignalPacket
+from prism.execution.mt5_bridge import PIP_SIZE, SignalPacket
+from prism.delivery.session_filter import session_label
 
 logger = logging.getLogger(__name__)
-
-SLACK_TOKEN = os.environ.get("PRISM_SLACK_TOKEN", "")
-SLACK_CHANNEL = os.environ.get("PRISM_SLACK_CHANNEL", "#prism-signals")
-CONFIRM_TIMEOUT_SEC = int(os.environ.get("PRISM_CONFIRM_TIMEOUT_SEC", "300"))  # 5 min
-
-# Pip sizes per instrument
-PIP_SIZE = {"XAUUSD": 0.01, "EURUSD": 0.0001, "GBPUSD": 0.0001, "USDJPY": 0.01}
 
 CONFIDENCE_EMOJI = {"HIGH": ":large_green_circle:", "MEDIUM": ":large_yellow_circle:", "LOW": ":red_circle:"}
 DIRECTION_EMOJI = {"LONG": ":chart_with_upwards_trend:", "SHORT": ":chart_with_downwards_trend:", "NEUTRAL": ":arrow_right:"}
@@ -44,8 +38,11 @@ class SlackNotifier:
     """Delivers PRISM trade signals to Slack with optional confirmation flow."""
 
     def __init__(self, token: Optional[str] = None, channel: Optional[str] = None):
-        self.token = token or SLACK_TOKEN
-        self.channel = channel or SLACK_CHANNEL
+        # Env reads happen at instantiation time (not import time) so test
+        # fixtures can set env vars before constructing a SlackNotifier.
+        self.token = token or os.environ.get("PRISM_SLACK_TOKEN", "")
+        self.channel = channel or os.environ.get("PRISM_SLACK_CHANNEL", "#prism-signals")
+        self.confirm_timeout_sec = int(os.environ.get("PRISM_CONFIRM_TIMEOUT_SEC", "300"))
         self.client = WebClient(token=self.token) if self.token else None
 
     def _pip_size(self, instrument: str) -> float:
@@ -65,8 +62,6 @@ class SlackNotifier:
         """Build Slack Block Kit payload for a signal."""
         pip = self._pip_size(signal.instrument)
         sl_pips = abs(signal.entry - signal.sl) / pip
-        tp1_pips = abs(signal.tp1 - signal.entry) / pip
-        tp2_pips = abs(signal.tp2 - signal.entry) / pip
         rr1 = self._calc_rr(signal.entry, signal.sl, signal.tp1)
         rr2 = self._calc_rr(signal.entry, signal.sl, signal.tp2)
 
@@ -84,15 +79,9 @@ class SlackNotifier:
             mitigated = "retest :white_check_mark:" if fvg.get("partially_mitigated") else "fresh zone :new:"
             fvg_str = f"{tf} {bottom:.2f}-{top:.2f} ({mitigated})"
 
-        # Session context
+        # Session context — single source of truth via session_filter
         now_utc = datetime.now(timezone.utc)
-        hour_utc = now_utc.hour
-        if 7 <= hour_utc < 11:
-            session_str = f"London Kill Zone ({now_utc.strftime('%H:%M')} UTC)"
-        elif 13 <= hour_utc < 17:
-            session_str = f"NY Kill Zone ({now_utc.strftime('%H:%M')} UTC)"
-        else:
-            session_str = f"Off-session ({now_utc.strftime('%H:%M')} UTC)"
+        session_str = session_label(now_utc)
 
         header = f"{signal.instrument}  {signal.direction}  {conf_emoji} {signal.confidence_level}"
         signal_time = signal.signal_time[:19].replace("T", " ") + " UTC"
@@ -130,46 +119,84 @@ class SlackNotifier:
         ]
         return blocks
 
-    def _format_confirm_blocks(self, signal: SignalPacket, message_ts: str) -> list:
-        """Add CONFIRM/SKIP action buttons below the signal."""
+    def _format_confirm_blocks(
+        self, signal: SignalPacket, message_ts: str, use_buttons: bool = True
+    ) -> list:
+        """
+        Build confirmation blocks below the signal.
+
+        use_buttons=True  → Slack action buttons (Phase 4 webhook mode).
+        use_buttons=False → Reaction instructions context block (Phase 3 poll mode).
+                            PollConfirmHandler watches for ✅/❌ reactions; buttons
+                            would do nothing in that flow.
+        """
         blocks = self._format_signal_blocks(signal)
-        blocks.append({
-            "type": "actions",
-            "block_id": f"prism_confirm_{signal.signal_time}",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "CONFIRM"},
-                    "style": "primary",
-                    "action_id": "prism_confirm",
-                    "value": message_ts,
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "SKIP"},
-                    "style": "danger",
-                    "action_id": "prism_skip",
-                    "value": message_ts,
-                },
-            ],
-        })
-        blocks.append({
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": f":timer_clock: Auto-expires in {CONFIRM_TIMEOUT_SEC // 60} minutes if no action taken",
-                }
-            ],
-        })
+        timeout_min = self.confirm_timeout_sec // 60
+
+        if use_buttons:
+            blocks.append({
+                "type": "actions",
+                "block_id": f"prism_confirm_{signal.signal_time}",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "CONFIRM"},
+                        "style": "primary",
+                        "action_id": "prism_confirm",
+                        "value": message_ts,
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "SKIP"},
+                        "style": "danger",
+                        "action_id": "prism_skip",
+                        "value": message_ts,
+                    },
+                ],
+            })
+            blocks.append({
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f":timer_clock: Auto-expires in {timeout_min} minutes if no action taken",
+                    }
+                ],
+            })
+        else:
+            # Poll mode: instruct the approver to use emoji reactions.
+            # PollConfirmHandler polls for ✅/❌ on this message.
+            blocks.append({
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            f":timer_clock: React :white_check_mark: to confirm "
+                            f"or :x: to skip (auto-expires in {timeout_min} min)"
+                        ),
+                    }
+                ],
+            })
+
         return blocks
 
-    def send_signal(self, signal: SignalPacket, mode: str = "CONFIRM") -> Optional[str]:
+    def send_signal(
+        self,
+        signal: SignalPacket,
+        mode: str = "CONFIRM",
+        use_buttons: bool = False,
+    ) -> Optional[str]:
         """
         Send signal to Slack.
 
-        mode: "CONFIRM" -- with approve/skip buttons
-              "NOTIFY"  -- formatted alert only, no buttons
+        mode: "CONFIRM" -- with confirmation prompt (buttons or reaction hint)
+              "NOTIFY"  -- formatted alert only, no confirmation prompt
+
+        use_buttons: relevant only when mode="CONFIRM".
+            False (default) -- Phase 3 poll mode: show reaction instructions.
+                               PollConfirmHandler monitors emoji reactions.
+            True            -- Phase 4 webhook mode: render action buttons.
 
         Returns message_ts (used to update the message on confirmation/expiry).
         """
@@ -179,7 +206,7 @@ class SlackNotifier:
 
         try:
             if mode == "CONFIRM":
-                blocks = self._format_confirm_blocks(signal, "pending")
+                blocks = self._format_confirm_blocks(signal, "pending", use_buttons=use_buttons)
             else:
                 blocks = self._format_signal_blocks(signal)
 
@@ -191,9 +218,9 @@ class SlackNotifier:
             ts = resp["ts"]
             logger.info(f"Signal sent to Slack: {signal.instrument} {signal.direction} ts={ts}")
 
-            # Update message with correct ts stamped into confirm button value
+            # Re-stamp the message with the real ts so any block references are correct.
             if mode == "CONFIRM":
-                updated_blocks = self._format_confirm_blocks(signal, ts)
+                updated_blocks = self._format_confirm_blocks(signal, ts, use_buttons=use_buttons)
                 self.client.chat_update(
                     channel=self.channel,
                     ts=ts,

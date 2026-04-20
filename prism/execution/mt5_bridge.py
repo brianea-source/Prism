@@ -61,6 +61,7 @@ class SignalPacket:
     fvg_zone: Optional[dict]
     signal_time: str
     model_version: str = "prism_v2.0"
+    signal_id: str = ""  # UUID assigned at generation time
 
 
 @dataclass

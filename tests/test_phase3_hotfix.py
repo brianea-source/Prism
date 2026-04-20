@@ -97,7 +97,7 @@ class StubNotifier:
         self.sent: list = []
         self.statuses: list = []
 
-    def send_signal(self, signal, mode="CONFIRM"):
+    def send_signal(self, signal, mode="CONFIRM", use_buttons=False):
         self.sent.append((signal, mode))
         return "1234567890.123456"
 
