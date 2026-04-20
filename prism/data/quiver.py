@@ -84,7 +84,7 @@ class QuiverClient:
         """
         cache_file = CACHE_DIR / "fear_greed.parquet"
         if cache_file.exists():
-            age_h = (pd.Timestamp.now() - pd.Timestamp(cache_file.stat().st_mtime, unit="s")).seconds / 3600
+            age_h = (pd.Timestamp.now() - pd.Timestamp(cache_file.stat().st_mtime, unit="s")).total_seconds() / 3600
             if age_h < 24:
                 return pd.read_parquet(cache_file)
 

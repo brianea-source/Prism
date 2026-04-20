@@ -164,23 +164,24 @@ class PRISMFeaturePipeline:
             df["fear_greed"] = np.nan
 
         # --- Target variables ---
-        # direction_4h: sign of close 4 bars forward vs current
-        df["direction_4h"] = np.sign(close.shift(-4) - close).astype(int)
+        # direction_fwd_4: sign of close 4 bars forward vs current close
+        # (timeframe-agnostic — '4 bars ahead' on whatever pipeline timeframe is configured, not necessarily 4 hours)
+        df["direction_fwd_4"] = np.sign(close.shift(-4) - close).astype(int)
         # magnitude: max favorable excursion next 20 bars (in pips)
         df["magnitude_pips"] = 0.0
         for i in range(len(df) - 20):
             future = df.iloc[i + 1:i + 21]
-            if df["direction_4h"].iloc[i] >= 0:
+            if df["direction_fwd_4"].iloc[i] >= 0:
                 df.at[df.index[i], "magnitude_pips"] = (future["high"].max() - close.iloc[i]) / self.pip_size
             else:
                 df.at[df.index[i], "magnitude_pips"] = (close.iloc[i] - future["low"].min()) / self.pip_size
 
         # Drop rows with NaN targets
-        df = df.dropna(subset=["direction_4h"]).reset_index(drop=True)
+        df = df.dropna(subset=["direction_fwd_4"]).reset_index(drop=True)
 
         # Store feature columns (exclude datetime, targets, raw OHLCV)
         exclude = {"datetime", "open", "high", "low", "close", "volume",
-                   "direction_4h", "magnitude_pips"}
+                   "direction_fwd_4", "magnitude_pips"}
         self._feature_cols = [c for c in df.columns if c not in exclude]
 
         logger.info(f"Feature matrix built: {len(df)} rows × {len(self._feature_cols)} features")
@@ -201,8 +202,8 @@ class PRISMFeaturePipeline:
 
         try:
             import yfinance as yf
-            from prism.data.tiingo import INSTRUMENT_MAP
-            ticker = INSTRUMENT_MAP.get(self.instrument, self.instrument) + "=X"
+            from prism.data.tiingo import YF_MAP
+            ticker = YF_MAP.get(self.instrument, self.instrument + "=X")
             yf_tf = {"H4": "4h", "H1": "1h", "M15": "15m", "D1": "1d"}.get(self.timeframe, "1h")
             raw = yf.download(ticker, start=start_date, end=end_date, interval=yf_tf, progress=False)
             if raw.empty:
@@ -246,8 +247,8 @@ class PRISMFeaturePipeline:
         test = df.iloc[split_idx:]
         X_train = train[self._feature_cols].fillna(0)
         X_test = test[self._feature_cols].fillna(0)
-        y_train = train["direction_4h"]
-        y_test = test["direction_4h"]
+        y_train = train["direction_fwd_4"]
+        y_test = test["direction_fwd_4"]
         logger.info(f"Train: {len(train)} rows | Test: {len(test)} rows | "
                     f"Features: {len(self._feature_cols)}")
         return X_train, X_test, y_train, y_test
