@@ -1,0 +1,36 @@
+# ============================================================
+# PRISM API Keys — Example Configuration
+# ============================================================
+# Copy this file to config/api_keys.yaml and fill in your keys.
+# api_keys.yaml is gitignored and should NEVER be committed.
+#
+# Alternatively, export the keys as environment variables:
+#   export TIINGO_API_KEY=your_key
+#   export FRED_API_KEY=your_key
+#   export QUIVER_API_KEY=your_key
+# ============================================================
+
+tiingo:
+  api_key: YOUR_TIINGO_API_KEY_HERE
+  # Free tier: 500 req/day, 50 req/min
+  # Paid: https://api.tiingo.com/account/api/token
+
+fred:
+  api_key: YOUR_FRED_API_KEY_HERE
+  # Free: https://fred.stlouisfed.org/docs/api/api_key.html
+  # No rate limit for reasonable use
+
+quiver:
+  api_key: YOUR_QUIVER_API_KEY_HERE
+  # Quiver Quantitative: https://www.quiverquant.com/
+  # COT reports fallback to CFTC public data if key absent
+
+mt5:
+  account: YOUR_MT5_ACCOUNT_NUMBER
+  password: YOUR_MT5_PASSWORD
+  server: YOUR_BROKER_SERVER
+  # e.g. server: ICMarkets-Demo01
+
+# Optional: OpenClaw Slack integration
+# openclaw:
+#   webhook_url: YOUR_SLACK_WEBHOOK_URL

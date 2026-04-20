@@ -32,3 +32,24 @@ models/*.joblib
 # Logs
 logs/
 *.log
+
+# API keys (never commit)
+config/api_keys.yaml
+.env
+
+# Data (large files)
+data/raw/
+data/processed/
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
