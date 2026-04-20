@@ -4,6 +4,8 @@ ICC Pattern Detector — Indication → Correction → Continuation
 Methodology by @tradesbysci (Sci, 460K YouTube)
 """
 import logging
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
@@ -113,7 +115,7 @@ def detect_icc_phase(
     return "NONE"
 
 
-def get_icc_entry(df: pd.DataFrame, instrument: str = "EURUSD") -> dict | None:
+def get_icc_entry(df: pd.DataFrame, instrument: str = "EURUSD") -> Optional[dict]:
     """
     Returns an ICC entry signal dict if a valid Continuation is detected,
     otherwise None.
@@ -153,7 +155,9 @@ def get_icc_entry(df: pd.DataFrame, instrument: str = "EURUSD") -> dict | None:
             "direction": "LONG",
             "entry": current_close,
             "sl": round(sl, 5),
+            "correction_low": float(correction_low),
             "correction_pct": round(correction_pct, 3),
+            "indication_range": float(indication_range),
             "indication_range_pips": round(indication_range / pip_size, 1),
             "aoi_nearby": False,  # Will be set by AOIDetector
         }
@@ -170,7 +174,9 @@ def get_icc_entry(df: pd.DataFrame, instrument: str = "EURUSD") -> dict | None:
             "direction": "SHORT",
             "entry": current_close,
             "sl": round(sl, 5),
+            "correction_high": float(correction_high),
             "correction_pct": round(correction_pct, 3),
+            "indication_range": float(indication_range),
             "indication_range_pips": round(indication_range / pip_size, 1),
             "aoi_nearby": False,
         }
@@ -225,3 +231,55 @@ class AOIDetector:
     def is_at_aoi(self, price: float, tolerance_pips: float = 20,
                   pip_size: float = 0.0001) -> bool:
         return len(self.get_nearby_aoi(price, tolerance_pips, pip_size)) > 0
+
+
+class ICCDetector:
+    """
+    High-level wrapper around the functional ICC detection utilities.
+    Provides detect_signals() compatible with SignalGenerator.
+    """
+
+    def detect_signals(self, df: pd.DataFrame, lookback: int = 20) -> list:
+        """
+        Run ICC phase detection on the given OHLCV dataframe.
+        Returns a list of signal dicts (zero or one element).
+
+        Each dict contains:
+            phase            : "CONTINUATION" if actionable, else other phase name
+            direction        : "LONG" | "SHORT"
+            entry            : current close
+            sl               : stop-loss level
+            correction_low   : lowest low of correction (for LONG SL)
+            correction_high  : highest high of correction (for SHORT SL)
+            leg_size         : estimated continuation leg size in price units
+            correction_pct   : retracement percentage of indication leg
+            indication_range_pips : size of indication leg in pips
+        """
+        raw = get_icc_entry(df)
+        if raw is None:
+            return []
+
+        phase_str = raw.get("phase", "NONE")
+
+        # Map phase name to simplified "CONTINUATION" for SignalGenerator filtering
+        if phase_str in ("CONTINUATION_LONG", "CONTINUATION_SHORT"):
+            mapped_phase = "CONTINUATION"
+        else:
+            mapped_phase = phase_str
+
+        # Leg-size estimate for TP2 target. Prefer the indication range measured by
+        # get_icc_entry() (swing_low → current_high for LONG, swing_high → current_low
+        # for SHORT); fall back to a lookback-window range if it is missing.
+        recent = df.iloc[-max(lookback, 10):]
+        fallback_range = float(recent["high"].max() - recent["low"].min())
+        indication_range = float(raw.get("indication_range", fallback_range))
+
+        signal = dict(raw)
+        signal["phase"] = mapped_phase
+        # Fibonacci extension of the indication leg as a continuation target.
+        signal["leg_size"] = indication_range * 0.618
+
+        # NOTE: correction_low / correction_high are emitted by get_icc_entry() as the
+        # actual swing extremes of the correction (before SL buffer). Downstream
+        # consumers (SignalGenerator._calculate_levels) then apply their own buffer.
+        return [signal]
