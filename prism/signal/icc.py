@@ -225,3 +225,56 @@ class AOIDetector:
     def is_at_aoi(self, price: float, tolerance_pips: float = 20,
                   pip_size: float = 0.0001) -> bool:
         return len(self.get_nearby_aoi(price, tolerance_pips, pip_size)) > 0
+
+
+class ICCDetector:
+    """
+    High-level wrapper around the functional ICC detection utilities.
+    Provides detect_signals() compatible with SignalGenerator.
+    """
+
+    def detect_signals(self, df: pd.DataFrame, lookback: int = 20) -> list:
+        """
+        Run ICC phase detection on the given OHLCV dataframe.
+        Returns a list of signal dicts (zero or one element).
+
+        Each dict contains:
+            phase            : "CONTINUATION" if actionable, else other phase name
+            direction        : "LONG" | "SHORT"
+            entry            : current close
+            sl               : stop-loss level
+            correction_low   : lowest low of correction (for LONG SL)
+            correction_high  : highest high of correction (for SHORT SL)
+            leg_size         : estimated continuation leg size in price units
+            correction_pct   : retracement percentage of indication leg
+            indication_range_pips : size of indication leg in pips
+        """
+        raw = get_icc_entry(df)
+        if raw is None:
+            return []
+
+        phase_str = raw.get("phase", "NONE")
+
+        # Map phase name to simplified "CONTINUATION" for SignalGenerator filtering
+        if phase_str in ("CONTINUATION_LONG", "CONTINUATION_SHORT"):
+            mapped_phase = "CONTINUATION"
+        else:
+            mapped_phase = phase_str
+
+        # Estimate leg size from recent swing data
+        recent = df.iloc[-max(lookback, 10):]
+        indication_range = (
+            (recent["high"].max() - recent["low"].min())
+        )
+
+        signal = dict(raw)
+        signal["phase"] = mapped_phase
+        # SL levels for generator _calculate_levels
+        if raw["direction"] == "LONG":
+            signal["correction_low"] = raw["sl"] + 0.0  # sl is already below correction low
+            signal["leg_size"] = indication_range * 0.618  # Fibonacci extension target
+        else:
+            signal["correction_high"] = raw["sl"] + 0.0  # sl is already above correction high
+            signal["leg_size"] = indication_range * 0.618
+
+        return [signal]
