@@ -143,7 +143,8 @@ class SignalGenerator:
             f"tp1={tp1} tp2={tp2} rr={rr:.2f} conf={confidence:.2f}"
         )
 
-        return SignalPacket(
+        # signal_id is auto-assigned via dataclass default_factory (uuid4).
+        packet = SignalPacket(
             instrument=self.instrument,
             direction=direction_str,
             entry=entry,
@@ -159,6 +160,7 @@ class SignalGenerator:
             fvg_zone=vars(fvg_zone),
             signal_time=datetime.now(timezone.utc).isoformat(),
         )
+        return packet
 
     def _calculate_levels(
         self,

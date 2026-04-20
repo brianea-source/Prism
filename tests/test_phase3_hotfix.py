@@ -96,8 +96,13 @@ class StubNotifier:
         self.channel = "#test-signals"
         self.sent: list = []
         self.statuses: list = []
+        # Mimic the real SlackNotifier surface the runner touches. Using an
+        # object() is enough — PollConfirmHandler is fully monkeypatched in
+        # these tests, so the client is never called for real.
+        self.client = object()
+        self.confirm_timeout_sec = 300
 
-    def send_signal(self, signal, mode="CONFIRM"):
+    def send_signal(self, signal, mode="CONFIRM", use_buttons=False, demo_warning=None):
         self.sent.append((signal, mode))
         return "1234567890.123456"
 

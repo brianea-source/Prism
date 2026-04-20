@@ -10,6 +10,7 @@ Requirements:
 """
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -61,6 +62,10 @@ class SignalPacket:
     fvg_zone: Optional[dict]
     signal_time: str
     model_version: str = "prism_v2.0"
+    # UUID stamped at construction time so every packet — whether built by the
+    # SignalGenerator, a retry, a reconciliation replay, or a test fixture —
+    # carries a stable audit ID without needing a post-hoc assignment.
+    signal_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
 @dataclass
@@ -366,7 +371,12 @@ class MT5Bridge:
             "tp": signal.tp2,
             "deviation": 20,
             "magic": MAGIC_NUMBER,
-            "comment": f"PRISM_{signal.direction}_{signal.confidence:.2f}",
+            # Short signal_id prefix keeps us under MT5's 31-char comment limit
+            # while still being unique enough to reconcile Slack ↔ MT5 ticket.
+            "comment": (
+                f"PRISM_{(signal.signal_id or '')[:8]}_"
+                f"{signal.direction}_{signal.confidence:.2f}"
+            ),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": self._pick_filling_mode(symbol),
         }
