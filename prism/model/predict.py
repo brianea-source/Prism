@@ -20,6 +20,38 @@ DIRECTION_RMAP = {0: -1, 1: 0, 2: 1}
 DIRECTION_STR = {-1: "SHORT", 0: "NEUTRAL", 1: "LONG"}
 CONFIDENCE_LEVEL = {0: "LOW", 1: "MEDIUM", 2: "HIGH"}
 
+# The four model artefacts PRISMPredictor loads for every instrument.
+# Kept as a module-level list so runner startup can verify them without
+# having to instantiate a PRISMPredictor (which is expensive and requires
+# loading the models into memory).
+MODEL_LAYER_NAMES = (
+    "layer1_xgb",
+    "layer1_lgb",
+    "layer2_magnitude",
+    "layer3_confidence",
+)
+
+
+def missing_model_files(instruments, model_dir=None) -> list:
+    """
+    Return the list of ``Path`` objects representing model files that
+    DON'T exist for the given instruments. Empty list = every instrument
+    has all four layers.
+
+    Used by the runner at startup to refuse to run in CONFIRM / AUTO mode
+    when any artefact is missing — otherwise SignalGenerator would raise
+    FileNotFoundError mid-scan, losing the signal and spamming Slack with
+    stack traces.
+    """
+    base = Path(model_dir) if model_dir is not None else MODEL_DIR
+    missing: list = []
+    for inst in instruments:
+        for name in MODEL_LAYER_NAMES:
+            path = base / f"{name}_{inst}.joblib"
+            if not path.exists():
+                missing.append(path)
+    return missing
+
 
 class PRISMPredictor:
     """

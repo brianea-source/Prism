@@ -90,6 +90,16 @@ class StubBridge:
         self.execute_calls.append(signal)
         return self._execute_result
 
+    # Phase 4 surface — these tests exercise the cache fallback path, so
+    # the bridge reports no live bars and get_bars returns empty. The
+    # runner will then fall through to _resolve_cache_paths + read_parquet.
+    def supports_live_bars(self):
+        return False
+
+    def get_bars(self, instrument, timeframe, count=500):
+        import pandas as pd
+        return pd.DataFrame()
+
 
 class StubNotifier:
     def __init__(self):
@@ -197,6 +207,14 @@ def _write_fake_parquet(tmp_path: Path, ticker: str = "GLD", timeframe: str = "4
 
 
 class TestConfirmDispatch:
+    @pytest.fixture(autouse=True)
+    def _reset_inflight_guard(self):
+        """Phase 4's per-instrument dedup holds module-level state; reset between tests."""
+        import prism.delivery.runner as runner_module
+        runner_module._last_signal_key.clear()
+        yield
+        runner_module._last_signal_key.clear()
+
     def test_confirm_confirmed_calls_submit_order_not_execute_signal(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         _write_fake_parquet(tmp_path, ticker="GLD")

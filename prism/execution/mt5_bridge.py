@@ -15,6 +15,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List
 
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover — pandas is a hard runtime dep
+    pd = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 # ---- Constants ----
@@ -42,6 +47,22 @@ APPROX_PIP_VALUE_PER_LOT = {
 # Common Exness symbol suffixes. Resolved at connect() time against
 # mt5.symbols_get() so we don't hard-code broker-specific naming.
 EXNESS_SUFFIX_CANDIDATES = ("", "m", "z", ".", ".m", "-m", "_m")
+
+# Bar period in minutes — used for the freshness guard. If the latest bar
+# pulled from MT5 is more than ~1.5× its own period old, the feed is stale.
+BAR_PERIOD_MINUTES = {
+    "M5": 5, "M15": 15, "M30": 30,
+    "H1": 60, "H4": 240, "D1": 1440,
+}
+
+# MT5 timeframe constant lookup. Set lazily at connect() time because the
+# MetaTrader5 module is Windows/Wine-only and we can't import it from tests.
+# Keys are PRISM canonical labels; values are the string attribute names on
+# the mt5 module that we resolve via getattr.
+_MT5_TF_ATTR = {
+    "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "M30": "TIMEFRAME_M30",
+    "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1",
+}
 
 
 @dataclass
@@ -155,6 +176,110 @@ class MT5Bridge:
             return 0.0
         info = self._mt5.account_info()
         return info.balance if info else 0.0
+
+    # ------------------------------------------------------------------
+    # Live bar access (Phase 4) — pulls OHLCV straight from MT5 so the
+    # signal stack no longer has to alias H4 parquet caches as M5.
+    # ------------------------------------------------------------------
+
+    def supports_live_bars(self) -> bool:
+        """True when the bridge can serve real live bars from MT5."""
+        return bool(self._connected and self._mt5 is not None)
+
+    def _resolve_timeframe(self, timeframe: str):
+        """Map PRISM canonical timeframe label → MT5 constant."""
+        attr = _MT5_TF_ATTR.get(timeframe)
+        if attr is None:
+            raise ValueError(
+                f"Unknown timeframe {timeframe!r}. "
+                f"Expected one of {list(_MT5_TF_ATTR)}"
+            )
+        mt5_tf = getattr(self._mt5, attr, None)
+        if mt5_tf is None:
+            raise ValueError(
+                f"MT5 module does not expose {attr}. "
+                f"Is MetaTrader5 installed and initialised?"
+            )
+        return mt5_tf
+
+    def get_bars(
+        self,
+        instrument: str,
+        timeframe: str,
+        count: int = 500,
+    ) -> "pd.DataFrame":
+        """
+        Pull the last ``count`` bars for ``instrument`` at ``timeframe``.
+
+        Returns a DataFrame with the columns PRISM's signal stack expects:
+        ``datetime`` (UTC, tz-aware), ``open``, ``high``, ``low``, ``close``,
+        ``volume``. Returns an empty DataFrame on any MT5 error so callers
+        can treat empty-vs-stale uniformly.
+
+        Notes:
+            * ``count`` defaults to 500 so the feature pipeline has enough
+              history for 200-period EMAs + ATR rolling windows.
+            * Volume is ``tick_volume`` (number of price updates). Exness
+              doesn't expose real volume on FX; tick volume is the standard
+              proxy used in every retail MT5 indicator.
+        """
+        if pd is None:
+            raise RuntimeError("pandas is required for get_bars")
+        if not self._connected or self._mt5 is None:
+            logger.warning(
+                "get_bars(%s, %s) called before MT5 connection — returning empty",
+                instrument, timeframe,
+            )
+            return pd.DataFrame()
+
+        symbol = self.resolve_symbol(instrument)
+        try:
+            mt5_tf = self._resolve_timeframe(timeframe)
+            rates = self._mt5.copy_rates_from_pos(symbol, mt5_tf, 0, count)
+        except Exception as exc:
+            logger.error("get_bars failed for %s %s: %s", instrument, timeframe, exc)
+            return pd.DataFrame()
+
+        if rates is None or len(rates) == 0:
+            logger.warning("No bars returned for %s %s (symbol=%s)", instrument, timeframe, symbol)
+            return pd.DataFrame()
+
+        # MT5 rates: structured array with time, open, high, low, close,
+        # tick_volume, spread, real_volume. Normalize to PRISM's column names.
+        df = pd.DataFrame(rates)
+        df["datetime"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df = df.rename(columns={"tick_volume": "volume"})
+        cols = ["datetime", "open", "high", "low", "close", "volume"]
+        return df[cols].reset_index(drop=True)
+
+    def bars_are_fresh(
+        self,
+        df: "pd.DataFrame",
+        timeframe: str,
+        now: Optional[datetime] = None,
+        max_age_factor: float = 1.5,
+    ) -> bool:
+        """
+        Return True if the latest bar is within ``max_age_factor × bar_period``
+        of ``now`` (UTC). 1.5× means one full missed bar is tolerated before
+        we reject the feed as stale.
+
+        Returns False for empty DataFrames, unknown timeframes, or bars whose
+        most recent timestamp is too old. Independent of self._connected so
+        the runner can also apply it to cache-backed Mock bridges.
+        """
+        if pd is None or df is None or df.empty or "datetime" not in df.columns:
+            return False
+        period_min = BAR_PERIOD_MINUTES.get(timeframe)
+        if period_min is None:
+            return False
+        now = now or datetime.now(timezone.utc)
+        last = pd.to_datetime(df["datetime"].iloc[-1])
+        if last.tzinfo is None:
+            last = last.tz_localize("UTC")
+        age_sec = (now - last.to_pydatetime()).total_seconds()
+        max_age_sec = period_min * 60 * max_age_factor
+        return 0 <= age_sec <= max_age_sec
 
     def count_open_positions(self, instrument: Optional[str] = None) -> int:
         if not self._connected:
@@ -449,6 +574,57 @@ class MockMT5Bridge(MT5Bridge):
 
     def resolve_symbol(self, instrument: str) -> str:
         return instrument
+
+    def supports_live_bars(self) -> bool:
+        """
+        Mock bridge cannot serve real live bars. The runner reads this to
+        decide whether to (a) raise a DEMO MODE banner in Slack and (b) fall
+        back to the parquet cache when the caller asks for H1/M5 — which are
+        not actually available in Mock and will be aliased from H4.
+        """
+        return False
+
+    def get_bars(self, instrument: str, timeframe: str, count: int = 500):
+        """
+        Mock bars come from the parquet cache on disk. The cache only has
+        4hour and daily files (written by the historical downloader), so
+        asking for H1/M15/M5 returns the 4hour file with a loud warning.
+        This keeps demo mode runnable without MT5 but callers should check
+        ``supports_live_bars()`` before trusting the result as a real feed.
+        """
+        if pd is None:
+            return None
+        # Import inside the method so tests that don't exercise the cache
+        # path (e.g. pure unit tests on get_bars semantics) don't pay for
+        # the pandas round-trip.
+        from pathlib import Path
+        from prism.data.tiingo import INSTRUMENT_MAP
+
+        tf_map = {
+            "H4": "4hour",
+            "D1": "daily",
+            # H1/M15/M5 all fall through to 4hour — aliased.
+            "H1": "4hour",
+            "M15": "4hour",
+            "M5": "4hour",
+        }
+        cache_tf = tf_map.get(timeframe, "4hour")
+        cache_dir = Path("data/raw")
+        ticker = INSTRUMENT_MAP.get(instrument, instrument)
+        candidates = {ticker, ticker.lower(), ticker.upper()}
+        paths = []
+        for t in candidates:
+            paths.extend(cache_dir.glob(f"tiingo_{t}_{cache_tf}_*.parquet"))
+        if not paths:
+            return pd.DataFrame()
+        df = pd.read_parquet(sorted(paths)[0])
+        # Normalise to the live-bars schema (datetime / ohlcv). The cache
+        # files already have these columns but may use 'date' instead.
+        if "datetime" not in df.columns and "date" in df.columns:
+            df = df.rename(columns={"date": "datetime"})
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+        return df.tail(count).reset_index(drop=True)
 
     def _pip_value_per_lot(self, symbol: str, instrument: str) -> float:
         # Preserve the original (approximate) retail values for deterministic tests.
