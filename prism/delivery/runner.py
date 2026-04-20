@@ -53,19 +53,42 @@ def _build_bridge():
     return bridge
 
 
+def _resolve_cache_paths(instrument: str, timeframe: str) -> list:
+    """
+    Resolve the parquet cache paths for an instrument + timeframe.
+
+    Cache files are written by TiingoClient.get_ohlcv as
+        tiingo_{ticker}_{timeframe}_{start}_{end}.parquet
+    where ticker = INSTRUMENT_MAP[symbol] (e.g. XAUUSD -> GLD). We must look up
+    the mapped ticker instead of globbing on the MT5 symbol name, otherwise
+    XAUUSD never matches its GLD-named cache file. We also glob case-
+    insensitively so FX pairs resolve whether the ticker is stored upper- or
+    lowercase (the mapping flipped case across PRs).
+    """
+    from pathlib import Path
+    from prism.data.tiingo import INSTRUMENT_MAP
+
+    cache_dir = Path("data/raw")
+    ticker = INSTRUMENT_MAP.get(instrument, instrument)
+
+    candidates = {ticker, ticker.lower(), ticker.upper()}
+    paths: list = []
+    for t in candidates:
+        paths.extend(cache_dir.glob(f"tiingo_{t}_{timeframe}_*.parquet"))
+    return sorted(set(paths))
+
+
 def _scan_instrument(instrument: str, notifier, bridge, now: datetime) -> None:
     """Scan one instrument, generate a signal if conditions are met, deliver to Slack."""
     import pandas as pd
-    from pathlib import Path
 
     from prism.signal.generator import SignalGenerator
     from prism.delivery.confirm_handler import PollConfirmHandler, ConfirmationResult
     from slack_sdk import WebClient
 
     # -- Data loading (Phase 4 will pull live bars from MT5) --
-    cache_dir = Path("data/raw")
-    h4_paths = sorted(cache_dir.glob(f"tiingo_*{instrument.lower()}*4hour*.parquet"))
-    d1_paths = sorted(cache_dir.glob(f"tiingo_*{instrument.lower()}*daily*.parquet"))
+    h4_paths = _resolve_cache_paths(instrument, "4hour")
+    d1_paths = _resolve_cache_paths(instrument, "daily")
 
     if not h4_paths and not d1_paths:
         logger.warning("%s: No cached data found -- skipping", instrument)
@@ -101,7 +124,11 @@ def _scan_instrument(instrument: str, notifier, bridge, now: datetime) -> None:
 
         if result == ConfirmationResult.CONFIRMED:
             notifier.update_signal_status(ts, "CONFIRMED", signal)
-            exec_result = bridge.execute_signal(signal)
+            # In CONFIRM mode, MT5Bridge.execute_signal deliberately returns
+            # success=False / status=PENDING_APPROVAL without sending. The
+            # human approval (this branch) is the gate, so we dispatch via
+            # submit_order which is the actual order-placement surface.
+            exec_result = bridge.submit_order(signal)
             if exec_result.success:
                 notifier.update_signal_status(ts, "EXECUTED", signal)
                 logger.info("%s: Executed — ticket=%s", instrument, exec_result.ticket)

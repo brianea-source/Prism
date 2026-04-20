@@ -3,6 +3,8 @@ prism/data/tiingo.py
 Tiingo API price data fetcher.
 API key: env var TIINGO_API_KEY
 """
+from __future__ import annotations
+
 import os
 import time
 import logging
