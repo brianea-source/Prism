@@ -33,7 +33,7 @@ def _make_dummy_data(n: int = 200, n_features: int = 20, seed: int = 42):
         columns=[f"feat_{i}" for i in range(n_features)],
     )
     # Deterministic labels so the test is repeatable
-    y = pd.Series((rng.integers(0, 3, size=n)), name="direction_4h")
+    y = pd.Series((rng.integers(0, 3, size=n)), name="direction_fwd_4")
     mags = pd.Series(rng.uniform(5, 50, size=n), name="magnitude_pips")
     df = pd.concat([X, y, mags], axis=1)
     return df
@@ -45,8 +45,8 @@ def _split(df, test_ratio=0.2):
     feature_cols = [c for c in df.columns if c.startswith("feat_")]
     X_train = df.iloc[:split][feature_cols].values.astype(np.float32)
     X_test = df.iloc[split:][feature_cols].values.astype(np.float32)
-    y_train = df.iloc[:split]["direction_4h"].values
-    y_test = df.iloc[split:]["direction_4h"].values
+    y_train = df.iloc[:split]["direction_fwd_4"].values
+    y_test = df.iloc[split:]["direction_fwd_4"].values
     return X_train, X_test, y_train, y_test, split
 
 
@@ -207,3 +207,101 @@ def test_backtest_runs_without_error():
     assert 0 <= metrics["win_rate"] <= 1
     assert metrics["total_trades"] >= 0
     print(f"  Backtest metrics: {metrics} — OK")
+
+
+# ---------------------------------------------------------------------------
+# Helper for PRISMPredictor integration tests
+# ---------------------------------------------------------------------------
+
+def make_dummy_features(n: int = 100, n_features: int = 20, seed: int = 42):
+    """
+    Return (X: pd.DataFrame, y: pd.Series) for PRISMPredictor integration tests.
+    y values are in {-1, 0, 1} (raw direction labels, as produced by build_features).
+    """
+    rng = np.random.default_rng(seed)
+    X = pd.DataFrame(
+        rng.standard_normal((n, n_features)),
+        columns=[f"feat_{i}" for i in range(n_features)],
+    )
+    y = pd.Series(rng.choice([-1, 0, 1], size=n), name="direction_fwd_4")
+    return X, y
+
+
+# ---------------------------------------------------------------------------
+# Test 5: PRISMPredictor.predict() returns per-row outputs
+# ---------------------------------------------------------------------------
+
+def test_predict_returns_per_row_outputs():
+    """PRISMPredictor.predict must return one result per input row, not batch mean."""
+    import xgboost as xgb
+    import lightgbm as lgb
+    from sklearn.ensemble import RandomForestClassifier
+    import joblib
+    import tempfile
+
+    # Train tiny fixture models
+    X, y = make_dummy_features(100)
+    y_mapped = y.map({-1: 0, 0: 1, 1: 2})
+
+    clf_xgb = xgb.XGBClassifier(
+        n_estimators=5, max_depth=2, random_state=42,
+        objective="multi:softprob", num_class=3, verbosity=0,
+    )
+    clf_lgb = lgb.LGBMClassifier(
+        n_estimators=5, max_depth=2, random_state=42,
+        objective="multiclass", num_class=3, verbose=-1,
+    )
+    reg = xgb.XGBRegressor(n_estimators=5, random_state=42, verbosity=0)
+    clf_rf = RandomForestClassifier(n_estimators=5, random_state=42)
+
+    clf_xgb.fit(X, y_mapped)
+    clf_lgb.fit(X, y_mapped)
+    reg.fit(X, np.random.default_rng(0).uniform(5, 50, 100))
+    clf_rf.fit(X, y_mapped)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mdir = Path(tmpdir)
+        joblib.dump(clf_xgb, mdir / "layer1_xgb_EURUSD.joblib")
+        joblib.dump(clf_lgb, mdir / "layer1_lgb_EURUSD.joblib")
+        joblib.dump(reg,     mdir / "layer2_magnitude_EURUSD.joblib")
+        joblib.dump(clf_rf,  mdir / "layer3_confidence_EURUSD.joblib")
+
+        # Patch MODEL_DIR before constructing the predictor
+        import prism.model.predict as predict_mod
+        original_dir = predict_mod.MODEL_DIR
+        predict_mod.MODEL_DIR = mdir
+        try:
+            predictor = predict_mod.PRISMPredictor("EURUSD")
+
+            # --- batch: 10 rows → 10 results each ---
+            result = predictor.predict(X.iloc[:10])
+            assert len(result["direction"]) == 10, (
+                f"Expected 10 directions for 10 rows, got {len(result['direction'])}"
+            )
+            assert len(result["magnitude_pips"]) == 10, "magnitude_pips length mismatch"
+            assert len(result["confidence"]) == 10, "confidence length mismatch"
+            assert len(result["confidence_level"]) == 10, "confidence_level length mismatch"
+            assert set(result["direction_str"]).issubset({"LONG", "SHORT", "NEUTRAL"}), (
+                f"Unexpected direction_str values: {set(result['direction_str'])}"
+            )
+            assert set(result["direction"]).issubset({-1, 0, 1}), (
+                f"Unexpected direction values: {set(result['direction'])}"
+            )
+
+            # --- predict_latest: returns scalars, not arrays ---
+            latest = predictor.predict_latest(X.iloc[:5])
+            assert isinstance(latest["direction"], (int, np.integer)), (
+                f"predict_latest direction should be scalar int, got {type(latest['direction'])}"
+            )
+            assert isinstance(latest["magnitude_pips"], (float, np.floating)), (
+                f"predict_latest magnitude_pips should be scalar float, got {type(latest['magnitude_pips'])}"
+            )
+            assert latest["direction_str"] in {"LONG", "SHORT", "NEUTRAL"}, (
+                f"predict_latest direction_str unexpected: {latest['direction_str']}"
+            )
+
+            print(f"  predict() batch=10 → directions={result['direction']} — OK")
+            print(f"  predict_latest() → direction={latest['direction']} ({latest['direction_str']}) — OK")
+
+        finally:
+            predict_mod.MODEL_DIR = original_dir

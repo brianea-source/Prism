@@ -12,7 +12,9 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
+# Module-level path — intentionally a plain variable (not a constant) so tests can
+# monkey-patch MODEL_DIR to point at a temporary directory with tiny fixture models.
+MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
 
 DIRECTION_RMAP = {0: -1, 1: 0, 2: 1}
 DIRECTION_STR = {-1: "SHORT", 0: "NEUTRAL", 1: "LONG"}
@@ -21,22 +23,26 @@ CONFIDENCE_LEVEL = {0: "LOW", 1: "MEDIUM", 2: "HIGH"}
 
 class PRISMPredictor:
     """
-    Loads all 4 PRISM model artefacts from `models/` and produces a single
-    unified signal dict from a feature DataFrame.
+    Loads all 4 PRISM model artefacts from `models/` and produces per-row
+    signal arrays from a feature DataFrame.
 
-    Usage:
+    Usage (live — single bar):
         predictor = PRISMPredictor("EURUSD")
-        signal = predictor.predict(X)
+        signal = predictor.predict_latest(feature_df)
         # → {"direction": 1, "direction_str": "LONG", "confidence": 0.72,
         #     "confidence_level": "HIGH", "magnitude_pips": 18.4}
+
+    Usage (backtesting — multiple bars):
+        result = predictor.predict(feature_df)
+        # → {"direction": array([1, -1, 0, ...]), ...}  — one value per input row
     """
 
     def __init__(self, instrument: str = "EURUSD"):
         self.instrument = instrument
-        self._xgb = None
-        self._lgbm = None
+        self._clf_xgb = None
+        self._clf_lgb = None
         self._reg = None
-        self._rf = None
+        self._clf_rf = None
         self._load_models()
 
     # ------------------------------------------------------------------
@@ -45,17 +51,18 @@ class PRISMPredictor:
 
     def _load_models(self) -> None:
         def _load(name: str):
-            path = MODELS_DIR / f"{name}_{self.instrument}.joblib"
+            # Use the module-level MODEL_DIR so tests can patch it.
+            path = MODEL_DIR / f"{name}_{self.instrument}.joblib"
             if not path.exists():
                 raise FileNotFoundError(
                     f"Model not found: {path}. Run PRISMTrainer.train_all_layers() first."
                 )
             return joblib.load(path)
 
-        self._xgb = _load("layer1_xgb")
-        self._lgbm = _load("layer1_lgbm")
-        self._reg = _load("layer2_reg")
-        self._rf = _load("layer3_rf")
+        self._clf_xgb = _load("layer1_xgb")
+        self._clf_lgb = _load("layer1_lgb")
+        self._reg = _load("layer2_magnitude")
+        self._clf_rf = _load("layer3_confidence")
         logger.info(f"[PRISMPredictor] All 4 models loaded for {self.instrument}")
 
     # ------------------------------------------------------------------
@@ -64,7 +71,9 @@ class PRISMPredictor:
 
     def predict(self, X: pd.DataFrame) -> dict[str, Any]:
         """
-        Produce ensemble prediction for the given feature matrix.
+        Run all layers on feature row(s).
+        For live trading, pass a single-row DataFrame (latest bar).
+        For backtesting, pass multiple rows — returns per-row arrays.
 
         Parameters
         ----------
@@ -74,35 +83,34 @@ class PRISMPredictor:
 
         Returns
         -------
-        dict with keys:
-            direction        : int     — -1 (short) | 0 (neutral) | 1 (long)
-            direction_str    : str     — "SHORT" | "NEUTRAL" | "LONG"
-            confidence       : float   — 0.0 to 1.0
-            confidence_level : str     — "LOW" | "MEDIUM" | "HIGH"
-            magnitude_pips   : float   — expected move magnitude in pips
+        dict with per-row arrays:
+            direction        : np.ndarray  — -1 (short) | 0 (neutral) | 1 (long), one per row
+            direction_str    : np.ndarray  — "SHORT" | "NEUTRAL" | "LONG", one per row
+            confidence       : np.ndarray  — max ensemble probability, one per row
+            confidence_level : np.ndarray  — "LOW" | "MEDIUM" | "HIGH", one per row
+            magnitude_pips   : np.ndarray  — expected pips, one per row
         """
         Xf = X.fillna(0).values.astype(np.float32)
 
-        # --- Layer 1: ensemble direction ---
-        xgb_proba = self._xgb.predict_proba(Xf)   # (n, 3)
-        lgbm_proba = self._lgbm.predict_proba(Xf)  # (n, 3)
-        avg_proba = (xgb_proba + lgbm_proba) / 2.0  # average ensemble
-        cls_idx = int(np.argmax(avg_proba.mean(axis=0)))  # aggregate across rows
-        direction = DIRECTION_RMAP[cls_idx]
-        direction_str = DIRECTION_STR[direction]
+        # --- Layer 1: per-row ensemble direction ---
+        xgb_proba = self._clf_xgb.predict_proba(Xf)   # shape: (n, 3)
+        lgb_proba = self._clf_lgb.predict_proba(Xf)    # shape: (n, 3)
+        avg_proba = (xgb_proba + lgb_proba) / 2.0      # shape: (n, 3)
 
-        # --- Layer 2: magnitude ---
-        magnitude_pips = float(np.mean(self._reg.predict(Xf)))
+        # Per-row argmax — NOT a mean across rows (which would collapse batch to a single scalar)
+        cls_idx = np.argmax(avg_proba, axis=1)          # shape: (n,)
+        confidence = avg_proba.max(axis=1)              # shape: (n,) — max proba = confidence
 
-        # --- Layer 3: confidence tier ---
-        conf_tier_raw = self._rf.predict(Xf)
-        conf_tier = int(round(float(np.mean(conf_tier_raw))))
-        conf_tier = max(0, min(2, conf_tier))
+        direction = np.array([DIRECTION_RMAP[c] for c in cls_idx])       # shape: (n,)
+        direction_str = np.array([DIRECTION_STR[d] for d in direction])  # shape: (n,)
 
-        # Map tier → numeric confidence
-        tier_to_float = {0: 0.25, 1: 0.55, 2: 0.80}
-        confidence = tier_to_float[conf_tier]
-        confidence_level = CONFIDENCE_LEVEL[conf_tier]
+        # --- Layer 2: per-row magnitude ---
+        magnitude_pips = self._reg.predict(Xf)          # shape: (n,)
+
+        # --- Layer 3: per-row confidence tier ---
+        conf_tier_raw = self._clf_rf.predict(Xf)        # shape: (n,)
+        confidence_level = np.array([CONFIDENCE_LEVEL[max(0, min(2, int(t)))]
+                                     for t in conf_tier_raw])            # shape: (n,)
 
         return {
             "direction": direction,
@@ -112,6 +120,16 @@ class PRISMPredictor:
             "magnitude_pips": magnitude_pips,
         }
 
-    def predict_row(self, X: pd.DataFrame) -> dict[str, Any]:
-        """Convenience: predict on a single row (same signature as predict)."""
-        return self.predict(X)
+    def predict_latest(self, X: pd.DataFrame) -> dict[str, Any]:
+        """
+        Convenience: predict on the last row of X only.
+        Returns scalars rather than arrays — use for live signal generation.
+
+        Example
+        -------
+            signal = predictor.predict_latest(feature_df)
+            if signal["direction"] == 1:
+                place_long_order(signal["magnitude_pips"])
+        """
+        result = self.predict(X.iloc[[-1]])
+        return {k: (v[0] if hasattr(v, "__len__") else v) for k, v in result.items()}
