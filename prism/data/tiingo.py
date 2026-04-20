@@ -15,12 +15,24 @@ logger = logging.getLogger(__name__)
 
 # Instrument mapping: MT5 symbol -> Tiingo ticker
 INSTRUMENT_MAP = {
-    "XAUUSD": "GLD",    # Gold ETF proxy
+    # NOTE: XAUUSD mapped to GLD (SPDR Gold ETF) as Tiingo proxy for spot gold.
+    # GLD tracks spot XAU/USD closely but has minor ETF-specific dynamics.
+    # Switch to "XAUUSD=X" via yfinance for spot-accurate data (see get_ohlcv fallback).
+    "XAUUSD": "GLD",
     "EURUSD": "EURUSD", # Tiingo forex
     "GBPUSD": "GBPUSD",
     "USDJPY": "USDJPY",
 }
 
+
+# yfinance ticker overrides — used when Tiingo is unavailable.
+# These differ from INSTRUMENT_MAP because yfinance uses its own symbol conventions.
+YF_MAP = {
+    "XAUUSD": "GC=F",    # Gold futures — spot-accurate proxy on yfinance (GLD=X does not exist)
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "USDJPY=X",
+}
 CACHE_DIR = Path("data/raw")
 
 class TiingoClient:
@@ -72,7 +84,7 @@ class TiingoClient:
                     {"startDate": start_date, "endDate": end_date, "format": "json"},
                 )
             else:
-                freq_map = {"1hour": "1Hour", "15min": "15Min", "5min": "5Min", "1min": "1Min"}
+                freq_map = {"1hour": "1Hour", "4hour": "4Hour", "15min": "15Min", "5min": "5Min", "1min": "1Min"}
                 data = self._get(
                     f"iex/{ticker}/prices",
                     {
