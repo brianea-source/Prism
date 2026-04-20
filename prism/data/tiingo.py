@@ -15,24 +15,32 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Instrument mapping: MT5 symbol -> Tiingo ticker.
+# Single source of truth for instrument routing. Each entry is
+#     SYMBOL -> (tiingo_ticker, endpoint_kind)
+# where `endpoint_kind` is either:
+#     "fx"     -> /tiingo/fx/{ticker}/prices  (daily & intraday — resampleFreq=1day | 1hour | ...)
+#     "equity" -> /tiingo/daily/{ticker}/prices  (daily)
+#                 /iex/{ticker}/prices          (intraday — IEX, equities-only)
 #
-# FX instruments (EURUSD / GBPUSD / USDJPY) are fetched from the Tiingo FX
-# endpoint `/tiingo/fx/{ticker}/prices` — NOT from IEX. IEX is equities-only
-# and returns empty data for forex tickers.
+# Never maintain _FX_INSTRUMENTS / INSTRUMENT_MAP / YF_MAP as independent
+# lookup tables — they drift (e.g. adding AUDUSD to one but not the other
+# silently routes requests to the wrong endpoint). Derive everything below
+# from this single map.
 #
-# XAUUSD is proxied by GLD (SPDR Gold ETF) via the equities endpoints because
-# Tiingo doesn't expose spot gold directly. For spot-accurate gold data switch
-# to yfinance fallback ("GC=F" gold futures). See YF_MAP below.
-INSTRUMENT_MAP = {
-    "XAUUSD": "GLD",
-    "EURUSD": "eurusd",   # Tiingo FX tickers are lowercase
-    "GBPUSD": "gbpusd",
-    "USDJPY": "usdjpy",
+# XAUUSD is proxied by GLD (SPDR Gold ETF) because Tiingo doesn't expose spot
+# gold directly. For spot-accurate gold bars, use the yfinance fallback
+# ("GC=F" gold futures) — see YF_MAP.
+INSTRUMENT_ROUTING: dict = {
+    # symbol -> (tiingo_ticker, endpoint_kind)
+    "XAUUSD": ("GLD",    "equity"),
+    "EURUSD": ("eurusd", "fx"),   # Tiingo FX tickers are lowercase per docs
+    "GBPUSD": ("gbpusd", "fx"),
+    "USDJPY": ("usdjpy", "fx"),
 }
 
-# Instruments routed through Tiingo's FX endpoint (not IEX / equities).
-_FX_INSTRUMENTS = {"EURUSD", "GBPUSD", "USDJPY"}
+# Derived lookup tables — DO NOT edit directly, edit INSTRUMENT_ROUTING.
+INSTRUMENT_MAP: dict = {sym: ticker for sym, (ticker, _) in INSTRUMENT_ROUTING.items()}
+_FX_INSTRUMENTS: set = {sym for sym, (_, kind) in INSTRUMENT_ROUTING.items() if kind == "fx"}
 
 
 # yfinance ticker overrides — used when Tiingo is unavailable.

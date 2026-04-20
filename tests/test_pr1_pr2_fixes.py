@@ -81,15 +81,23 @@ def test_train_all_layers_then_predict_roundtrip(monkeypatch):
     """
     from prism.model import train as train_mod
     from prism.model import predict as predict_mod
+    from prism.data import pipeline as pipeline_mod
 
     with tempfile.TemporaryDirectory() as tmpdir:
         mdir = Path(tmpdir)
         # Redirect both trainer and predictor to the temp models directory.
         monkeypatch.setattr(train_mod, "MODELS_DIR", mdir)
         monkeypatch.setattr(predict_mod, "MODEL_DIR", mdir)
-        # Avoid importing the real feature pipeline (requires network/FRED/etc).
+
+        # Patch the feature pipeline on the SOURCE module. train.py currently
+        # does a late `from prism.data.pipeline import PRISMFeaturePipeline`
+        # inside train_all_layers(), so the name is re-resolved on every call
+        # and this interception works. If train.py later moves the import
+        # to module-level, the second setattr below also intercepts.
+        # Keeping both is defence-in-depth, not duplication.
+        monkeypatch.setattr(pipeline_mod, "PRISMFeaturePipeline", _FakePipeline)
         monkeypatch.setattr(
-            "prism.data.pipeline.PRISMFeaturePipeline", _FakePipeline
+            train_mod, "PRISMFeaturePipeline", _FakePipeline, raising=False
         )
 
         trainer = train_mod.PRISMTrainer("EURUSD", timeframe="H1")
@@ -287,13 +295,91 @@ def test_fred_cpi_yoy_computed_on_raw_monthly_series(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4. Sanity: INSTRUMENT_MAP is consistent with FX routing
+# 4. Anti-drift: single source of truth for instrument routing
 # ---------------------------------------------------------------------------
 
-def test_instrument_map_fx_tickers_lowercase():
-    """Tiingo FX tickers are lowercase. Keep INSTRUMENT_MAP aligned so we
-    don't accidentally request `/tiingo/fx/EURUSD/prices` (which may 404)."""
-    from prism.data.tiingo import INSTRUMENT_MAP, _FX_INSTRUMENTS
+def test_instrument_routing_single_source_of_truth():
+    """Every instrument that callers can look up through INSTRUMENT_MAP or
+    _FX_INSTRUMENTS MUST be classified in INSTRUMENT_ROUTING. This fails
+    loudly if someone adds (say) AUDUSD to _FX_INSTRUMENTS without also
+    wiring it into INSTRUMENT_ROUTING — which would silently route the
+    request through the wrong endpoint.
+    """
+    from prism.data.tiingo import (
+        INSTRUMENT_ROUTING, INSTRUMENT_MAP, _FX_INSTRUMENTS,
+    )
 
+    # 1. Every symbol in INSTRUMENT_MAP is in the routing table (derived
+    #    tables should never outgrow the source).
+    assert set(INSTRUMENT_MAP.keys()) == set(INSTRUMENT_ROUTING.keys()), (
+        f"INSTRUMENT_MAP drifted from INSTRUMENT_ROUTING: "
+        f"extra={set(INSTRUMENT_MAP) - set(INSTRUMENT_ROUTING)}, "
+        f"missing={set(INSTRUMENT_ROUTING) - set(INSTRUMENT_MAP)}"
+    )
+
+    # 2. Every symbol in _FX_INSTRUMENTS is classified as "fx" in routing.
     for sym in _FX_INSTRUMENTS:
-        assert INSTRUMENT_MAP[sym] == INSTRUMENT_MAP[sym].lower()
+        assert sym in INSTRUMENT_ROUTING, (
+            f"{sym} is in _FX_INSTRUMENTS but missing from INSTRUMENT_ROUTING"
+        )
+        assert INSTRUMENT_ROUTING[sym][1] == "fx", (
+            f"{sym} is tagged fx in _FX_INSTRUMENTS but routed "
+            f"as {INSTRUMENT_ROUTING[sym][1]!r} in INSTRUMENT_ROUTING"
+        )
+
+    # 3. Every entry classified "fx" is in _FX_INSTRUMENTS (reverse direction).
+    fx_from_routing = {sym for sym, (_, kind) in INSTRUMENT_ROUTING.items()
+                       if kind == "fx"}
+    assert fx_from_routing == _FX_INSTRUMENTS, (
+        f"_FX_INSTRUMENTS drifted from INSTRUMENT_ROUTING: "
+        f"extra={_FX_INSTRUMENTS - fx_from_routing}, "
+        f"missing={fx_from_routing - _FX_INSTRUMENTS}"
+    )
+
+    # 4. All FX tickers must be lowercase — Tiingo FX endpoint is case-
+    #    sensitive in URL path (/tiingo/fx/eurusd/prices works; uppercase 404s).
+    for sym in _FX_INSTRUMENTS:
+        assert INSTRUMENT_MAP[sym] == INSTRUMENT_MAP[sym].lower(), (
+            f"FX ticker {INSTRUMENT_MAP[sym]!r} for {sym} must be lowercase"
+        )
+
+    # 5. Endpoint kind must be one of the two supported values.
+    for sym, (_, kind) in INSTRUMENT_ROUTING.items():
+        assert kind in {"fx", "equity"}, (
+            f"{sym} has unknown endpoint_kind={kind!r} "
+            f"(tiingo.py only knows 'fx' and 'equity')"
+        )
+
+
+def test_iex_intraday_uses_lowercase_resample_freq():
+    """Regression guard for the IEX resampleFreq casing — Tiingo docs show
+    lowercase ('1hour', '4hour', '5min' etc). If someone changes the map
+    back to capitalised values this test fails loudly."""
+    from prism.data.tiingo import TiingoClient
+
+    # Inspect the freq_map used inside get_ohlcv via a throwaway call that
+    # short-circuits before the HTTP request. We rely on the captured params.
+    import tempfile as _tempfile
+    from prism.data import tiingo as tiingo_mod
+
+    client = TiingoClient(api_key="test-key")
+    captured: dict = {}
+
+    def fake_get(endpoint: str, params: dict):
+        captured["params"] = params
+        return [{"date": "2024-01-01T00:00:00Z",
+                 "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}]
+
+    with _tempfile.TemporaryDirectory() as td:
+        original_cache = tiingo_mod.CACHE_DIR
+        try:
+            tiingo_mod.CACHE_DIR = Path(td)
+            client._get = fake_get
+            client.get_ohlcv("XAUUSD", "2024-01-01", "2024-01-02", "4hour")
+        finally:
+            tiingo_mod.CACHE_DIR = original_cache
+
+    assert captured["params"]["resampleFreq"] == "4hour", (
+        f"IEX resampleFreq must be lowercase per Tiingo docs; got "
+        f"{captured['params']['resampleFreq']!r}"
+    )
