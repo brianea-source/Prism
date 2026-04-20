@@ -252,6 +252,47 @@ class MT5Bridge:
         cols = ["datetime", "open", "high", "low", "close", "volume"]
         return df[cols].reset_index(drop=True)
 
+    def deals_since_utc_midnight(
+        self,
+        now: Optional[datetime] = None,
+        magic_number: int = MAGIC_NUMBER,
+    ) -> list:
+        """
+        Return PRISM-magic deals closed since UTC 00:00 of ``now`` (default:
+        now()). Each entry is a dict with ``{"ticket", "profit", "symbol",
+        "time"}``.
+
+        Used by ``DrawdownGuard`` to compute realized daily PnL from the
+        canonical source (MT5 deal history) rather than guessing from
+        local state. Filters by magic number so hand-placed or non-PRISM
+        trades don't count against the kill-switch.
+
+        Returns an empty list when disconnected, when MT5 errors, or when
+        no PRISM deals exist for the period.
+        """
+        if not self._connected or self._mt5 is None:
+            return []
+        now = now or datetime.now(timezone.utc)
+        midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        try:
+            deals = self._mt5.history_deals_get(midnight, now)
+        except Exception as e:
+            logger.warning("history_deals_get failed: %s", e)
+            return []
+        if not deals:
+            return []
+        out: list = []
+        for d in deals:
+            if getattr(d, "magic", None) != magic_number:
+                continue
+            out.append({
+                "ticket": getattr(d, "ticket", None),
+                "profit": float(getattr(d, "profit", 0.0) or 0.0),
+                "symbol": getattr(d, "symbol", ""),
+                "time": int(getattr(d, "time", 0)),
+            })
+        return out
+
     def bars_are_fresh(
         self,
         df: "pd.DataFrame",
@@ -583,6 +624,10 @@ class MockMT5Bridge(MT5Bridge):
         not actually available in Mock and will be aliased from H4.
         """
         return False
+
+    def deals_since_utc_midnight(self, now=None, magic_number=MAGIC_NUMBER) -> list:
+        """Mock bridge has no deal history; realized PnL tracked manually in tests."""
+        return []
 
     def get_bars(self, instrument: str, timeframe: str, count: int = 500):
         """

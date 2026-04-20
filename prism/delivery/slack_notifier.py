@@ -349,3 +349,33 @@ class SlackNotifier:
             )
         except SlackApiError as e:
             logger.error(f"Slack daily brief error: {e.response['error']}")
+
+    def send_alert(self, text: str) -> Optional[str]:
+        """
+        Send a plain alert to the signals channel. Used by the drawdown
+        guard (and future operational alerts) where a single line of text
+        is more appropriate than a full Block Kit signal card.
+
+        Returns the Slack message ts on success, None otherwise (no client,
+        or an API error). Callers that need one-shot semantics — e.g. the
+        drawdown guard's "halt" notification — must track their own
+        already-sent bit; this method doesn't dedupe.
+        """
+        if not self.client:
+            logger.info("Slack alert (no client): %s", text)
+            return None
+        try:
+            resp = self.client.chat_postMessage(
+                channel=self.channel,
+                text=text,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": text},
+                    }
+                ],
+            )
+            return resp.get("ts")
+        except SlackApiError as e:
+            logger.error(f"Slack alert error: {e.response['error']}")
+            return None
