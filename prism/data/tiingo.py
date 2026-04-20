@@ -88,13 +88,12 @@ class TiingoClient:
                 logger.warning(f"No data returned for {ticker}")
                 return df
 
-            # Normalize column names
-            df = df.rename(columns={"date": "datetime", "adjOpen": "open",
-                                     "adjHigh": "high", "adjLow": "low",
-                                     "adjClose": "close", "adjVolume": "volume"})
-            for col in ["open", "high", "low", "close"]:
-                if col not in df.columns and f"adj{col.capitalize()}" not in df.columns:
-                    df[col] = df.get(col, None)
+            # Select adjusted columns only to avoid duplicate column names
+            col_map = {"date": "datetime", "adjOpen": "open",
+                       "adjHigh": "high", "adjLow": "low",
+                       "adjClose": "close", "adjVolume": "volume"}
+            keep = [c for c in col_map if c in df.columns]
+            df = df[keep].rename(columns=col_map)
 
             df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
             df = df.sort_values("datetime").reset_index(drop=True)
