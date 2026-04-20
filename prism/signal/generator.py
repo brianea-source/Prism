@@ -2,10 +2,10 @@
 PRISM Signal Generator — orchestrates all layers into a complete signal.
 
 Flow:
-1. Layer 0: News check (block if high-impact event imminent)
+1. Layer 0: News check (block if high-impact event inside blackout window)
 2. Layer 1: H4 regime (XGBoost direction)
 3. Layer 2: ICC pattern (H1 structure)
-4. Layer 3: FVG zone (M15/M5 entry trigger)
+4. Layer 3: FVG zone with M5 break-and-retest confirmation
 5. Layer 4: SL/TP calculation
 6. Output: SignalPacket ready for execution
 
@@ -32,9 +32,11 @@ MIN_RR = 1.5
 class SignalGenerator:
     """Orchestrates all PRISM layers to produce a trade signal."""
 
-    def __init__(self, instrument: str, model_dir: str = "models"):
+    def __init__(self, instrument: str, model_dir: str = "models",
+                 persist_fvg: bool = True):
         self.instrument = instrument
         self.model_dir = model_dir
+        self.persist_fvg = persist_fvg
         self.news = NewsIntelligence()
         self.icc = ICCDetector()
         self.fvg = FVGDetector(instrument, "H4")
@@ -103,13 +105,29 @@ class SignalGenerator:
 
         icc_signal = active_icc[-1]  # Most recent
 
+        # ICC direction must agree with ML direction
+        if icc_signal.get("direction") != direction_str:
+            logger.info(
+                f"ICC direction ({icc_signal.get('direction')}) disagrees with ML "
+                f"({direction_str}) — skipping"
+            )
+            return None
+
         # --- Layer 3: FVG Entry (M15/M5) ---
         self.fvg.detect(h4_df)  # Refresh H4 FVG zones
+        if self.persist_fvg:
+            try:
+                self.fvg.save()
+            except Exception as e:
+                # Persistence must never break signal generation.
+                logger.warning(f"FVG save failed: {e}")
         current_price = float(entry_df["close"].iloc[-1])
-        fvg_zone = self.fvg.check_entry_trigger(current_price, direction_str)
+        fvg_zone = self.fvg.check_entry_trigger(
+            current_price, direction_str, m5_df=entry_df
+        )
 
         if fvg_zone is None:
-            logger.debug("Price not in active FVG zone — no entry")
+            logger.debug("Price not in active FVG zone with retest — no entry")
             return None
 
         # --- Layer 4: SL/TP Calculation ---
@@ -149,7 +167,14 @@ class SignalGenerator:
         icc_signal: dict,
         fvg_zone: FVGZone,
     ) -> tuple:
-        """Calculate entry, SL, TP1, TP2, RR."""
+        """
+        Calculate entry, SL, TP1, TP2, RR.
+
+        SL anchor: the furthest of the ICC correction extreme and the FVG zone
+        boundary, plus a small pip buffer. correction_low / correction_high from
+        ICCDetector are the *raw* correction extremes (no buffer) — this function
+        owns the buffer, so ICC's own stop-loss buffer is not double-counted.
+        """
         pip = PIP_SIZE.get(self.instrument, 0.0001)
         latest = df.iloc[-1]
         current_price = float(latest["close"])
@@ -157,8 +182,9 @@ class SignalGenerator:
 
         if direction == "LONG":
             entry = fvg_zone.midline if fvg_zone.midline < current_price else current_price
-            icc_low = icc_signal.get("correction_low", entry - atr * 1.5)
-            sl = min(icc_low, fvg_zone.bottom) - (pip * 5)
+            icc_low = float(icc_signal.get("correction_low", entry - atr * 1.5))
+            sl_anchor = min(icc_low, fvg_zone.bottom)
+            sl = sl_anchor - (pip * 5)
             sl_pips = (entry - sl) / pip
             swing_high = float(df["high"].iloc[-20:].max())
             tp1 = max(swing_high, entry + sl_pips * pip * 1.5)
@@ -166,8 +192,9 @@ class SignalGenerator:
             tp2 = entry + leg_size
         else:  # SHORT
             entry = fvg_zone.midline if fvg_zone.midline > current_price else current_price
-            icc_high = icc_signal.get("correction_high", entry + atr * 1.5)
-            sl = max(icc_high, fvg_zone.top) + (pip * 5)
+            icc_high = float(icc_signal.get("correction_high", entry + atr * 1.5))
+            sl_anchor = max(icc_high, fvg_zone.top)
+            sl = sl_anchor + (pip * 5)
             sl_pips = (sl - entry) / pip
             swing_low = float(df["low"].iloc[-20:].min())
             tp1 = min(swing_low, entry - sl_pips * pip * 1.5)

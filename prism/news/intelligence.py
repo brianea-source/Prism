@@ -4,20 +4,27 @@ Monitors: Tiingo news sentiment, ForexFactory economic calendar, geopolitical RS
 
 Outputs:
 - news_bias: BULLISH / BEARISH / NEUTRAL per instrument
-- event_flag: True if high-impact event within 30 min (block trading)
+- event_flag: True if high-impact event is inside the configured blackout window
 - risk_regime: RISK_ON / RISK_OFF / NEUTRAL (geopolitical)
-- volume_anomaly: True if volume spike detected
+- volume_anomaly: True if volume spike detected (future hook; currently always False)
 """
 import logging
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Optional
-import requests
 import os
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple, List
+
+import requests
 
 logger = logging.getLogger(__name__)
 
 TIINGO_KEY = os.environ.get("TIINGO_API_KEY", "")
+
+# Event blackout window (in minutes) around high-impact events.
+# Trades are blocked from [event_time - EVENT_BLACKOUT_BEFORE_MIN]
+# to [event_time + EVENT_BLACKOUT_AFTER_MIN]. Overridable via env for tuning.
+EVENT_BLACKOUT_BEFORE_MIN = int(os.environ.get("PRISM_EVENT_BLACKOUT_BEFORE_MIN", "30"))
+EVENT_BLACKOUT_AFTER_MIN = int(os.environ.get("PRISM_EVENT_BLACKOUT_AFTER_MIN", "15"))
 
 # Geopolitical keywords that shift gold to RISK-OFF (bullish for XAU, bearish for risk FX)
 RISK_OFF_KEYWORDS = [
@@ -49,12 +56,49 @@ class NewsSignal:
     instrument: str
     timestamp: str
     news_bias: str           # BULLISH / BEARISH / NEUTRAL
-    event_flag: bool         # High-impact event imminent (block trading)
-    event_name: str          # Name of upcoming event if event_flag
+    event_flag: bool         # True while inside [event - before, event + after]
+    event_name: str          # Name of the triggering event if event_flag
     risk_regime: str         # RISK_ON / RISK_OFF / NEUTRAL
     sentiment_score: float   # -1.0 to 1.0
     geopolitical_active: bool
     sources: list
+    volume_anomaly: bool = False  # Placeholder; wired in Phase 3 volume layer
+
+
+def _extract_tiingo_sentiment(article: dict) -> Optional[float]:
+    """
+    Normalize Tiingo's sentiment field to a float in [-1, 1].
+
+    Tiingo returns `sentiment` as either:
+      * a float (older responses)
+      * a dict like {"compound": -0.12, "pos": 0.0, "neg": 0.3, "neu": 0.7}
+      * missing entirely
+    Returns None if no usable value is found so the caller can fall back to
+    keyword scoring.
+    """
+    s = article.get("sentiment") if isinstance(article, dict) else None
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        try:
+            val = float(s)
+        except (TypeError, ValueError):
+            return None
+        return max(-1.0, min(1.0, val))
+    if isinstance(s, dict):
+        # Prefer a compound score; fall back to pos - neg
+        if "compound" in s:
+            try:
+                return max(-1.0, min(1.0, float(s["compound"])))
+            except (TypeError, ValueError):
+                return None
+        try:
+            pos = float(s.get("pos", 0.0) or 0.0)
+            neg = float(s.get("neg", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return max(-1.0, min(1.0, pos - neg))
+    return None
 
 
 class NewsIntelligence:
@@ -76,7 +120,7 @@ class NewsIntelligence:
 
         return NewsSignal(
             instrument=instrument,
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             news_bias=news_bias,
             event_flag=event_flag,
             event_name=event_name,
@@ -84,6 +128,7 @@ class NewsIntelligence:
             sentiment_score=sentiment,
             geopolitical_active=geo_active,
             sources=["tiingo", "forex_factory_calendar", "geopolitical_rss"],
+            volume_anomaly=False,
         )
 
     def _get_tiingo_sentiment(self, instrument: str) -> float:
@@ -93,22 +138,28 @@ class NewsIntelligence:
         tickers = NEWS_TICKER_MAP.get(instrument, [])
         if not tickers:
             return 0.0
-        scores = []
+        scores: List[float] = []
         try:
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
             for ticker in tickers[:2]:  # Limit to 2 tickers to avoid rate limits
                 url = "https://api.tiingo.com/tiingo/news"
                 params = {"tickers": ticker, "startDate": cutoff, "limit": 10}
                 r = self.session.get(url, params=params, timeout=10)
-                if r.status_code == 200:
-                    articles = r.json()
-                    for article in articles:
-                        if "sentiment" in article:
-                            scores.append(article["sentiment"])
-                        else:
-                            title = article.get("title", "").lower()
-                            score = self._keyword_sentiment(title, instrument)
-                            scores.append(score)
+                if r.status_code != 200:
+                    continue
+                articles = r.json()
+                if not isinstance(articles, list):
+                    continue
+                for article in articles:
+                    if not isinstance(article, dict):
+                        continue
+                    structured = _extract_tiingo_sentiment(article)
+                    if structured is not None:
+                        scores.append(structured)
+                        continue
+                    # No structured sentiment — fall back to keyword scoring
+                    title = str(article.get("title", "")).lower()
+                    scores.append(self._keyword_sentiment(title, instrument))
         except Exception as e:
             logger.warning(f"Tiingo news fetch failed for {instrument}: {e}")
         return float(sum(scores) / len(scores)) if scores else 0.0
@@ -141,10 +192,12 @@ class NewsIntelligence:
             return 0.0
         return (pos - neg) / total
 
-    def _check_economic_calendar(self, instrument: str) -> tuple:
+    def _check_economic_calendar(self, instrument: str) -> Tuple[bool, str]:
         """
-        Check ForexFactory calendar for high-impact events in next 30 minutes.
-        Returns (event_flag, event_name).
+        Check ForexFactory calendar for high-impact events inside the blackout window.
+        The blackout window is [event_time - EVENT_BLACKOUT_BEFORE_MIN,
+        event_time + EVENT_BLACKOUT_AFTER_MIN]. Trades are blocked while `now`
+        is within that window for a relevant currency.
         """
         currency_map = {
             "XAUUSD": ["USD"],
@@ -159,33 +212,34 @@ class NewsIntelligence:
             if r.status_code != 200:
                 return False, ""
             events = r.json()
+            if not isinstance(events, list):
+                return False, ""
             now = datetime.now(timezone.utc)
-            window_end = now + timedelta(minutes=30)
 
             for event in events:
+                if not isinstance(event, dict):
+                    continue
                 if event.get("impact") != "High":
                     continue
                 if event.get("currency") not in relevant_currencies:
                     continue
-                try:
-                    event_time_str = event.get("date", "")
-                    if not event_time_str:
-                        continue
-                    event_time = datetime.fromisoformat(event_time_str.replace("Z", "+00:00"))
-                    if now <= event_time <= window_end:
-                        return True, event.get("title", "High-impact event")
-                except Exception:
+                event_time = _parse_event_time(event.get("date", ""))
+                if event_time is None:
                     continue
+                window_start = event_time - timedelta(minutes=EVENT_BLACKOUT_BEFORE_MIN)
+                window_end = event_time + timedelta(minutes=EVENT_BLACKOUT_AFTER_MIN)
+                if window_start <= now <= window_end:
+                    return True, event.get("title") or event.get("event") or "High-impact event"
         except Exception as e:
             logger.warning(f"Economic calendar check failed: {e}")
 
         return False, ""
 
-    def _check_geopolitical(self, instrument: str) -> tuple:
+    def _check_geopolitical(self, instrument: str) -> Tuple[str, bool]:
         """
         Check RSS feeds for geopolitical keywords.
         Returns (risk_regime, geo_active).
-        risk_regime: RISK_OFF / RISK_ON / NEUTRAL
+        Headlines are deduped across feeds to avoid double-counting.
         """
         rss_feeds = [
             "https://feeds.reuters.com/reuters/topNews",
@@ -195,50 +249,89 @@ class NewsIntelligence:
         if instrument not in geo_relevant:
             return "NEUTRAL", False
 
+        try:
+            import feedparser  # local import — optional dependency
+        except ImportError:
+            logger.warning(
+                "feedparser not installed — skipping geopolitical RSS scan. "
+                "Add `feedparser` to requirements.txt to enable."
+            )
+            return "NEUTRAL", False
+
+        seen_titles: set = set()
         risk_off_count = 0
         risk_on_count = 0
+        per_feed_counts: dict = {}
 
         for feed_url in rss_feeds:
+            feed_off = 0
+            feed_on = 0
             try:
-                import feedparser
                 feed = feedparser.parse(feed_url)
                 for entry in feed.entries[:20]:
-                    text = (entry.get("title", "") + " " + entry.get("summary", "")).lower()
-                    risk_off_count += sum(1 for kw in RISK_OFF_KEYWORDS if kw in text)
-                    risk_on_count += sum(1 for kw in RISK_ON_KEYWORDS if kw in text)
+                    title = (entry.get("title", "") or "").strip().lower()
+                    if not title or title in seen_titles:
+                        continue
+                    seen_titles.add(title)
+                    summary = (entry.get("summary", "") or "").lower()
+                    text = f"{title} {summary}"
+                    feed_off += sum(1 for kw in RISK_OFF_KEYWORDS if kw in text)
+                    feed_on += sum(1 for kw in RISK_ON_KEYWORDS if kw in text)
             except Exception as e:
                 logger.warning(f"RSS fetch failed for {feed_url}: {e}")
+                continue
+            risk_off_count += feed_off
+            risk_on_count += feed_on
+            per_feed_counts[feed_url] = (feed_off, feed_on)
 
-        geo_active = risk_off_count > 2  # 3+ risk-off mentions = active
+        if per_feed_counts:
+            logger.debug(f"Geopolitical RSS counts per feed: {per_feed_counts}")
+
+        geo_active = risk_off_count > 2
         if risk_off_count > risk_on_count and risk_off_count > 2:
             return "RISK_OFF", geo_active
-        elif risk_on_count > risk_off_count and risk_on_count > 2:
+        if risk_on_count > risk_off_count and risk_on_count > 2:
             return "RISK_ON", geo_active
         return "NEUTRAL", geo_active
 
     def _derive_bias(self, sentiment: float, risk_regime: str, instrument: str) -> str:
         """Combine sentiment + geopolitical regime into directional bias."""
-        # Gold: risk-off is bullish
         if instrument == "XAUUSD":
             if risk_regime == "RISK_OFF":
                 return "BULLISH"
-            elif risk_regime == "RISK_ON":
+            if risk_regime == "RISK_ON":
                 return "BEARISH"
-        # USD pairs: risk-off is bearish (USD strengthens vs risk FX)
-        elif instrument in ["EURUSD", "GBPUSD"]:
+        elif instrument in ("EURUSD", "GBPUSD"):
             if risk_regime == "RISK_OFF":
                 return "BEARISH"
-            elif risk_regime == "RISK_ON":
+            if risk_regime == "RISK_ON":
                 return "BULLISH"
-        # Fall back to sentiment
         if sentiment > 0.2:
             return "BULLISH"
-        elif sentiment < -0.2:
+        if sentiment < -0.2:
             return "BEARISH"
         return "NEUTRAL"
 
-    def should_block_trade(self, signal: NewsSignal) -> tuple:
+    def should_block_trade(self, signal: NewsSignal) -> Tuple[bool, str]:
         """Return (blocked, reason) if trade should be prevented."""
         if signal.event_flag:
             return True, f"High-impact event imminent: {signal.event_name}"
         return False, ""
+
+
+def _parse_event_time(raw: str) -> Optional[datetime]:
+    """
+    Parse an ISO-8601 / ForexFactory-style datetime string to a UTC-aware datetime.
+    Returns None if the input is empty or unparseable.
+    """
+    if not raw:
+        return None
+    try:
+        # Handle trailing 'Z' (UTC designator), which fromisoformat doesn't accept pre-3.11
+        cleaned = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)

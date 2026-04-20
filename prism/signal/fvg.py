@@ -11,17 +11,18 @@ Strategy:
 - Break & retest of FVG boundary = entry trigger
 - SL below FVG zone (LONG) or above (SHORT)
 """
-from dataclasses import dataclass
+import json
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-import json
-import logging
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
-FVG_STORE = Path("signals/fvg_zones.json")
+FVG_STORE_DIR = Path("signals")
 
 
 @dataclass
@@ -37,7 +38,13 @@ class FVGZone:
     mitigated: bool = False            # True if price closed through full zone
     partially_mitigated: bool = False  # Price hit midline but closed back
     age_bars: int = 0                  # How many bars since formation
-    strength: float = 0.0             # Gap size relative to ATR (larger = stronger)
+    strength: float = 0.0              # Gap size relative to ATR (larger = stronger)
+    retest_confirmed: bool = False     # Price left zone then returned (break & retest)
+
+
+def _store_path(instrument: str, timeframe: str) -> Path:
+    """Namespaced JSON path per instrument/timeframe for multi-instrument deployments."""
+    return FVG_STORE_DIR / f"fvg_zones_{instrument}_{timeframe}.json"
 
 
 class FVGDetector:
@@ -58,8 +65,7 @@ class FVGDetector:
         Bullish: df[i-2].high < df[i].low  -> gap between them
         Bearish: df[i-2].low > df[i].high  -> gap between them
         """
-        zones = []
-        # Reset index to ensure iloc == positional index
+        zones: list = []
         df = df.reset_index(drop=True)
         atr = df[atr_col].values if atr_col in df.columns else np.ones(len(df))
 
@@ -143,43 +149,80 @@ class FVGDetector:
         price: float,
         direction: str,
         entry_type: str = "midline",  # "midline" or "boundary"
+        m5_df: Optional[pd.DataFrame] = None,
+        retest_lookback: int = 3,
     ) -> Optional[FVGZone]:
         """
         Check if current price is triggering an entry in an active FVG zone.
+
         direction: "LONG" or "SHORT"
-        Returns the matching zone if entry conditions are met, else None.
+        m5_df: optional recent M5 bars (must have 'high', 'low', 'close'). When
+               provided, the zone is only returned after a break-and-retest is
+               confirmed — i.e. at least one of the last `retest_lookback` M5 bars
+               traded outside the zone before the current bar returned to it.
+               When omitted, behavior matches the original price-in-zone check.
         """
         active = self.get_active_zones()
         for zone in active:
             if direction == "LONG" and zone.direction == "BULLISH":
                 target = zone.midline if entry_type == "midline" else zone.bottom
                 if price <= zone.top and price >= target:
-                    return zone
+                    if self._retest_confirmed(zone, m5_df, retest_lookback):
+                        zone.retest_confirmed = True
+                        return zone
             elif direction == "SHORT" and zone.direction == "BEARISH":
                 target = zone.midline if entry_type == "midline" else zone.top
                 if price >= zone.bottom and price <= target:
-                    return zone
+                    if self._retest_confirmed(zone, m5_df, retest_lookback):
+                        zone.retest_confirmed = True
+                        return zone
         return None
 
-    def save(self):
-        """Persist active zones to JSON store."""
-        FVG_STORE.parent.mkdir(exist_ok=True)
+    @staticmethod
+    def _retest_confirmed(
+        zone: FVGZone,
+        m5_df: Optional[pd.DataFrame],
+        lookback: int,
+    ) -> bool:
+        """
+        A retest is confirmed when recent M5 price action traded outside the zone
+        before the current bar returned to it. If no M5 df is provided we trust
+        the caller's price check (soft mode, v0 behavior).
+        """
+        if m5_df is None or len(m5_df) == 0:
+            return True
+        tail = m5_df.tail(lookback + 1)
+        if len(tail) < 2:
+            return True
+        # Look at all but the final bar — did price leave the zone at any point?
+        prior = tail.iloc[:-1]
+        if zone.direction == "BULLISH":
+            # Outside = above top (impulse away) or below bottom (failed test)
+            return bool(((prior["low"] > zone.top) | (prior["high"] < zone.bottom)).any())
+        return bool(((prior["high"] < zone.bottom) | (prior["low"] > zone.top)).any())
+
+    def save(self, path: Optional[Path] = None):
+        """Persist active zones to a per-(instrument, timeframe) JSON store."""
+        target = Path(path) if path else _store_path(self.instrument, self.timeframe)
+        target.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "updated_at": datetime.utcnow().isoformat(),
             "instrument": self.instrument,
             "timeframe": self.timeframe,
             "zones": [vars(z) for z in self.get_active_zones()],
         }
-        with open(FVG_STORE, "w") as f:
+        with open(target, "w") as f:
             json.dump(data, f, indent=2)
-        logger.info(f"Saved {len(data['zones'])} active FVG zones to {FVG_STORE}")
+        logger.info(f"Saved {len(data['zones'])} active FVG zones to {target}")
 
     @classmethod
-    def load(cls, instrument: str, timeframe: str = "H4") -> "FVGDetector":
-        """Load zones from JSON store."""
+    def load(cls, instrument: str, timeframe: str = "H4",
+             path: Optional[Path] = None) -> "FVGDetector":
+        """Load zones from the per-(instrument, timeframe) JSON store."""
         detector = cls(instrument, timeframe)
-        if FVG_STORE.exists():
-            with open(FVG_STORE) as f:
+        target = Path(path) if path else _store_path(instrument, timeframe)
+        if target.exists():
+            with open(target) as f:
                 data = json.load(f)
             detector.zones = [FVGZone(**z) for z in data.get("zones", [])]
         return detector

@@ -4,6 +4,8 @@ ICC Pattern Detector — Indication → Correction → Continuation
 Methodology by @tradesbysci (Sci, 460K YouTube)
 """
 import logging
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
@@ -113,7 +115,7 @@ def detect_icc_phase(
     return "NONE"
 
 
-def get_icc_entry(df: pd.DataFrame, instrument: str = "EURUSD") -> dict | None:
+def get_icc_entry(df: pd.DataFrame, instrument: str = "EURUSD") -> Optional[dict]:
     """
     Returns an ICC entry signal dict if a valid Continuation is detected,
     otherwise None.
@@ -153,7 +155,9 @@ def get_icc_entry(df: pd.DataFrame, instrument: str = "EURUSD") -> dict | None:
             "direction": "LONG",
             "entry": current_close,
             "sl": round(sl, 5),
+            "correction_low": float(correction_low),
             "correction_pct": round(correction_pct, 3),
+            "indication_range": float(indication_range),
             "indication_range_pips": round(indication_range / pip_size, 1),
             "aoi_nearby": False,  # Will be set by AOIDetector
         }
@@ -170,7 +174,9 @@ def get_icc_entry(df: pd.DataFrame, instrument: str = "EURUSD") -> dict | None:
             "direction": "SHORT",
             "entry": current_close,
             "sl": round(sl, 5),
+            "correction_high": float(correction_high),
             "correction_pct": round(correction_pct, 3),
+            "indication_range": float(indication_range),
             "indication_range_pips": round(indication_range / pip_size, 1),
             "aoi_nearby": False,
         }
@@ -261,20 +267,19 @@ class ICCDetector:
         else:
             mapped_phase = phase_str
 
-        # Estimate leg size from recent swing data
+        # Leg-size estimate for TP2 target. Prefer the indication range measured by
+        # get_icc_entry() (swing_low → current_high for LONG, swing_high → current_low
+        # for SHORT); fall back to a lookback-window range if it is missing.
         recent = df.iloc[-max(lookback, 10):]
-        indication_range = (
-            (recent["high"].max() - recent["low"].min())
-        )
+        fallback_range = float(recent["high"].max() - recent["low"].min())
+        indication_range = float(raw.get("indication_range", fallback_range))
 
         signal = dict(raw)
         signal["phase"] = mapped_phase
-        # SL levels for generator _calculate_levels
-        if raw["direction"] == "LONG":
-            signal["correction_low"] = raw["sl"] + 0.0  # sl is already below correction low
-            signal["leg_size"] = indication_range * 0.618  # Fibonacci extension target
-        else:
-            signal["correction_high"] = raw["sl"] + 0.0  # sl is already above correction high
-            signal["leg_size"] = indication_range * 0.618
+        # Fibonacci extension of the indication leg as a continuation target.
+        signal["leg_size"] = indication_range * 0.618
 
+        # NOTE: correction_low / correction_high are emitted by get_icc_entry() as the
+        # actual swing extremes of the correction (before SL buffer). Downstream
+        # consumers (SignalGenerator._calculate_levels) then apply their own buffer.
         return [signal]

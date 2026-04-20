@@ -371,3 +371,379 @@ def test_fvg_check_entry_trigger_long():
     # Price above top → no trigger
     zone2 = detector.check_entry_trigger(1.1060, "LONG")
     assert zone2 is None
+
+
+# ---------------------------------------------------------------------------
+# New: Tiingo sentiment normalization (structured vs scalar vs missing)
+# ---------------------------------------------------------------------------
+
+def test_tiingo_sentiment_extractor_handles_compound_dict():
+    """Tiingo may return sentiment as {'compound': -0.3, ...} — must extract float."""
+    from prism.news.intelligence import _extract_tiingo_sentiment
+    assert _extract_tiingo_sentiment({"sentiment": {"compound": -0.3}}) == pytest.approx(-0.3)
+
+
+def test_tiingo_sentiment_extractor_handles_scalar():
+    from prism.news.intelligence import _extract_tiingo_sentiment
+    assert _extract_tiingo_sentiment({"sentiment": 0.4}) == pytest.approx(0.4)
+
+
+def test_tiingo_sentiment_extractor_missing_returns_none():
+    from prism.news.intelligence import _extract_tiingo_sentiment
+    assert _extract_tiingo_sentiment({"title": "no sentiment here"}) is None
+
+
+def test_tiingo_sentiment_extractor_pos_neg_fallback():
+    """dict without 'compound' should fall back to pos - neg."""
+    from prism.news.intelligence import _extract_tiingo_sentiment
+    score = _extract_tiingo_sentiment({"sentiment": {"pos": 0.6, "neg": 0.1, "neu": 0.3}})
+    assert score == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# New: Economic calendar blackout window (T-30m through T+15m)
+# ---------------------------------------------------------------------------
+
+def test_economic_calendar_blocks_inside_window():
+    """Event 10 minutes in the future must trigger event_flag=True (pre-release)."""
+    import prism.news.intelligence as ni_mod
+    from datetime import datetime, timezone, timedelta
+
+    event_time = datetime.now(timezone.utc) + timedelta(minutes=10)
+    fake_events = [{
+        "impact": "High",
+        "currency": "USD",
+        "date": event_time.isoformat(),
+        "title": "NFP",
+    }]
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return fake_events
+
+    with patch.object(ni_mod.requests, "get", return_value=FakeResp()):
+        ni = NewsIntelligence()
+        flag, name = ni._check_economic_calendar("XAUUSD")
+    assert flag is True
+    assert name == "NFP"
+
+
+def test_economic_calendar_blocks_just_after_event():
+    """Within T+15m after a high-impact event, blackout must still be active."""
+    import prism.news.intelligence as ni_mod
+    from datetime import datetime, timezone, timedelta
+
+    event_time = datetime.now(timezone.utc) - timedelta(minutes=5)  # 5 min ago
+    fake_events = [{
+        "impact": "High",
+        "currency": "USD",
+        "date": event_time.isoformat(),
+        "title": "CPI",
+    }]
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return fake_events
+
+    with patch.object(ni_mod.requests, "get", return_value=FakeResp()):
+        ni = NewsIntelligence()
+        flag, _ = ni._check_economic_calendar("XAUUSD")
+    assert flag is True
+
+
+def test_economic_calendar_does_not_block_far_future_event():
+    """Event 2 hours away must not trigger the blackout."""
+    import prism.news.intelligence as ni_mod
+    from datetime import datetime, timezone, timedelta
+
+    event_time = datetime.now(timezone.utc) + timedelta(hours=2)
+    fake_events = [{
+        "impact": "High",
+        "currency": "USD",
+        "date": event_time.isoformat(),
+        "title": "FOMC",
+    }]
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return fake_events
+
+    with patch.object(ni_mod.requests, "get", return_value=FakeResp()):
+        ni = NewsIntelligence()
+        flag, _ = ni._check_economic_calendar("XAUUSD")
+    assert flag is False
+
+
+# ---------------------------------------------------------------------------
+# New: FVG retest confirmation + per-instrument persistence
+# ---------------------------------------------------------------------------
+
+def test_fvg_retest_requires_price_left_zone():
+    """
+    With M5 df where price never left the zone, retest_confirmed should fail
+    and check_entry_trigger returns None.
+    """
+    detector = FVGDetector("EURUSD", "H4")
+    detector.zones = [
+        FVGZone("EURUSD", "H4", "BULLISH", 1.1050, 1.1000, 1.1025,
+                "2024-01-01", 0, age_bars=5, strength=0.5),
+    ]
+    # M5 bars all sitting inside the zone — no break out, no retest
+    m5 = pd.DataFrame([
+        {"open": 1.1020, "high": 1.1030, "low": 1.1015, "close": 1.1025},
+        {"open": 1.1025, "high": 1.1035, "low": 1.1020, "close": 1.1030},
+        {"open": 1.1030, "high": 1.1040, "low": 1.1025, "close": 1.1030},
+    ])
+    assert detector.check_entry_trigger(1.1030, "LONG", m5_df=m5) is None
+
+
+def test_fvg_retest_confirmed_after_breakout():
+    """
+    With M5 df where price impulsed above the zone then came back,
+    check_entry_trigger should return the zone and mark retest_confirmed=True.
+    """
+    detector = FVGDetector("EURUSD", "H4")
+    detector.zones = [
+        FVGZone("EURUSD", "H4", "BULLISH", 1.1050, 1.1000, 1.1025,
+                "2024-01-01", 0, age_bars=5, strength=0.5),
+    ]
+    # Prior bars: price well above zone (low > top). Current bar: back inside.
+    m5 = pd.DataFrame([
+        {"open": 1.1080, "high": 1.1100, "low": 1.1070, "close": 1.1090},
+        {"open": 1.1085, "high": 1.1095, "low": 1.1065, "close": 1.1075},
+        {"open": 1.1070, "high": 1.1075, "low": 1.1060, "close": 1.1065},
+        {"open": 1.1040, "high": 1.1045, "low": 1.1025, "close": 1.1030},
+    ])
+    zone = detector.check_entry_trigger(1.1030, "LONG", m5_df=m5)
+    assert zone is not None
+    assert zone.retest_confirmed is True
+
+
+def test_fvg_save_and_load_namespaced(tmp_path, monkeypatch):
+    """Save writes to signals/fvg_zones_<INSTR>_<TF>.json; load round-trips."""
+    import prism.signal.fvg as fvg_mod
+    monkeypatch.setattr(fvg_mod, "FVG_STORE_DIR", tmp_path)
+    detector = FVGDetector("EURUSD", "H4")
+    detector.zones = [
+        FVGZone("EURUSD", "H4", "BULLISH", 1.1050, 1.1000, 1.1025,
+                "2024-01-01", 0, age_bars=5, strength=0.5),
+    ]
+    detector.save()
+    expected = tmp_path / "fvg_zones_EURUSD_H4.json"
+    assert expected.exists()
+
+    loaded = FVGDetector.load("EURUSD", "H4")
+    assert len(loaded.zones) == 1
+    assert loaded.zones[0].bottom == pytest.approx(1.1000)
+
+
+# ---------------------------------------------------------------------------
+# New: MT5 Bridge CONFIRM mode returns PENDING_APPROVAL (no execution)
+# ---------------------------------------------------------------------------
+
+def test_mt5_confirm_mode_returns_pending_approval():
+    """CONFIRM mode must not execute — caller must submit_order after approval."""
+    from prism.execution.mt5_bridge import MT5Bridge
+    bridge = MT5Bridge(mode="CONFIRM")
+    # Do NOT connect — CONFIRM must gate before touching MT5 at all.
+    signal = _make_signal_packet()
+    result = bridge.execute_signal(signal)
+    assert result.success is False
+    assert result.status == "PENDING_APPROVAL"
+    assert result.ticket is None
+    assert result.error is None
+
+
+def test_mt5_notify_mode_does_not_execute():
+    from prism.execution.mt5_bridge import MT5Bridge
+    bridge = MT5Bridge(mode="NOTIFY")
+    signal = _make_signal_packet()
+    result = bridge.execute_signal(signal)
+    assert result.status == "NOTIFY"
+    assert result.success is False
+
+
+# ---------------------------------------------------------------------------
+# New: MT5 filling-mode picker adapts to broker
+# ---------------------------------------------------------------------------
+
+def test_pick_filling_mode_prefers_ioc_when_supported():
+    """symbol_info.filling_mode with bit 1 set → IOC."""
+    from prism.execution.mt5_bridge import MT5Bridge
+    bridge = MT5Bridge(mode="AUTO")
+    mt5_mock = MagicMock()
+    mt5_mock.ORDER_FILLING_IOC = "IOC"
+    mt5_mock.ORDER_FILLING_FOK = "FOK"
+    mt5_mock.ORDER_FILLING_RETURN = "RETURN"
+    mt5_mock.symbol_info.return_value = MagicMock(filling_mode=2)  # IOC bit
+    bridge._mt5 = mt5_mock
+    assert bridge._pick_filling_mode("EURUSDm") == "IOC"
+
+
+def test_pick_filling_mode_falls_back_to_return():
+    from prism.execution.mt5_bridge import MT5Bridge
+    bridge = MT5Bridge(mode="AUTO")
+    mt5_mock = MagicMock()
+    mt5_mock.ORDER_FILLING_IOC = "IOC"
+    mt5_mock.ORDER_FILLING_FOK = "FOK"
+    mt5_mock.ORDER_FILLING_RETURN = "RETURN"
+    mt5_mock.symbol_info.return_value = MagicMock(filling_mode=4)  # only RETURN bit
+    bridge._mt5 = mt5_mock
+    assert bridge._pick_filling_mode("EURUSD") == "RETURN"
+
+
+# ---------------------------------------------------------------------------
+# New: End-to-end SignalGenerator → SignalPacket integration
+# ---------------------------------------------------------------------------
+
+def _build_h4_with_bullish_fvg(n: int = 40, base: float = 1.1000) -> pd.DataFrame:
+    """
+    Build an H4 frame ending in an unmitigated BULLISH FVG zone near the current price.
+    Layout: flat rails, a single 3-bar FVG in the middle, then flat rails hovering
+    inside the zone so the last bar's close sits between zone midline and top.
+    """
+    import datetime as _dt
+    rows = []
+    ts = datetime(2024, 1, 1)
+
+    for i in range(n - 10):
+        rows.append({
+            "datetime": ts + _dt.timedelta(hours=4 * i),
+            "open": base, "high": base + 0.0005, "low": base - 0.0005, "close": base,
+            "volume": 100, "atr_14": 0.001,
+        })
+
+    # 3-bar bullish FVG: high of prev2 (1.1000) < low of curr (1.1030) → gap
+    fvg_base_idx = len(rows)
+    rows[-1]["high"] = 1.1000
+    rows[-1]["low"] = 1.0990
+    rows[-1]["close"] = 1.1000
+    rows.append({
+        "datetime": ts + _dt.timedelta(hours=4 * (len(rows))),
+        "open": 1.1010, "high": 1.1040, "low": 1.1005, "close": 1.1035,
+        "volume": 200, "atr_14": 0.001,
+    })
+    rows.append({
+        "datetime": ts + _dt.timedelta(hours=4 * (len(rows))),
+        "open": 1.1035, "high": 1.1060, "low": 1.1030, "close": 1.1050,
+        "volume": 200, "atr_14": 0.001,
+    })
+
+    # Subsequent bars: dip into zone without closing below bottom (1.1000)
+    for j in range(8):
+        rows.append({
+            "datetime": ts + _dt.timedelta(hours=4 * (len(rows))),
+            "open": 1.1020, "high": 1.1045, "low": 1.1016, "close": 1.1020,
+            "volume": 150, "atr_14": 0.001,
+        })
+
+    df = pd.DataFrame(rows)
+    df["rsi_14"] = 55.0  # dummy feature so feature_cols is non-empty
+    return df
+
+
+def test_signal_generator_end_to_end_returns_packet(tmp_path, monkeypatch):
+    """
+    Integration: with mocked news + predictor + ICC + synthetic H4/M5 data aligning
+    on a bullish FVG zone, generate() should produce a SignalPacket.
+    """
+    import prism.signal.fvg as fvg_mod
+    from prism.signal.generator import SignalGenerator
+    monkeypatch.setattr(fvg_mod, "FVG_STORE_DIR", tmp_path)
+
+    gen = SignalGenerator("EURUSD")
+
+    # Layer 0: clear
+    gen.news.get_signal = MagicMock(return_value=NewsSignal(
+        instrument="EURUSD",
+        timestamp="2024-01-01T12:00:00",
+        news_bias="BULLISH",
+        event_flag=False,
+        event_name="",
+        risk_regime="NEUTRAL",
+        sentiment_score=0.3,
+        geopolitical_active=False,
+        sources=[],
+    ))
+    gen.news.should_block_trade = MagicMock(return_value=(False, ""))
+
+    # Layer 1: predictor says LONG high-conf
+    mock_predictor = MagicMock()
+    mock_predictor.predict_latest.return_value = {
+        "direction": 1,
+        "direction_str": "LONG",
+        "confidence": 0.78,
+        "confidence_level": "HIGH",
+        "magnitude_pips": 35.0,
+    }
+    gen._predictor = mock_predictor
+
+    # Layer 2: ICC continuation LONG
+    gen.icc.detect_signals = MagicMock(return_value=[{
+        "phase": "CONTINUATION",
+        "direction": "LONG",
+        "entry": 1.1020,
+        "sl": 1.0990,
+        "correction_low": 1.0995,
+        "leg_size": 0.0060,
+        "correction_pct": 0.4,
+        "indication_range": 0.0050,
+        "indication_range_pips": 50.0,
+        "aoi_nearby": False,
+    }])
+
+    # Layer 3: build H4 dataframe with a real bullish FVG zone
+    h4_df = _build_h4_with_bullish_fvg()
+
+    # M5 df: prior bars sit above the zone top (1.1030) so retest fires, final bar inside.
+    m5_rows = []
+    for _ in range(3):
+        m5_rows.append({"open": 1.1055, "high": 1.1065, "low": 1.1045, "close": 1.1060})
+    m5_rows.append({"open": 1.1035, "high": 1.1040, "low": 1.1025, "close": 1.1030})
+    entry_df = pd.DataFrame(m5_rows)
+    entry_df["atr_14"] = 0.001
+
+    packet = gen.generate(h4_df=h4_df, h1_df=h4_df, entry_df=entry_df)
+
+    assert packet is not None, "Expected SignalPacket when all layers align"
+    assert packet.direction == "LONG"
+    assert packet.instrument == "EURUSD"
+    assert packet.rr_ratio >= 1.5
+    assert packet.sl < packet.entry < packet.tp2
+    assert packet.fvg_zone is not None
+    # Persistence side effect: per-instrument FVG store was written
+    assert (tmp_path / "fvg_zones_EURUSD_H4.json").exists()
+
+
+def test_signal_generator_skips_when_icc_disagrees_with_ml():
+    """ML says LONG but ICC continuation is SHORT → generator must return None."""
+    from prism.signal.generator import SignalGenerator
+    gen = SignalGenerator("EURUSD", persist_fvg=False)
+
+    gen.news.get_signal = MagicMock(return_value=NewsSignal(
+        instrument="EURUSD", timestamp="t", news_bias="NEUTRAL",
+        event_flag=False, event_name="", risk_regime="NEUTRAL",
+        sentiment_score=0.0, geopolitical_active=False, sources=[],
+    ))
+    gen.news.should_block_trade = MagicMock(return_value=(False, ""))
+
+    mock_predictor = MagicMock()
+    mock_predictor.predict_latest.return_value = {
+        "direction": 1, "direction_str": "LONG", "confidence": 0.75,
+        "confidence_level": "HIGH", "magnitude_pips": 20.0,
+    }
+    gen._predictor = mock_predictor
+    gen.icc.detect_signals = MagicMock(return_value=[{
+        "phase": "CONTINUATION", "direction": "SHORT",
+        "entry": 1.0, "sl": 1.1, "correction_high": 1.05,
+        "leg_size": 0.005, "correction_pct": 0.4,
+        "indication_range": 0.01, "indication_range_pips": 100.0,
+        "aoi_nearby": False,
+    }])
+
+    df = _make_flat_df(30)
+    df["rsi_14"] = 50.0
+    assert gen.generate(h4_df=df, h1_df=df, entry_df=df) is None

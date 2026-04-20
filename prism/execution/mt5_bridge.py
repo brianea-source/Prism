@@ -1,7 +1,7 @@
 """
 PRISM MT5 Execution Bridge — Exness integration.
 Connects to MetaTrader5 terminal via Python API.
-Supports CONFIRM mode (Slack approval) and AUTO mode.
+Supports CONFIRM mode (Slack approval gated elsewhere), AUTO mode, NOTIFY mode.
 
 Requirements:
 - MetaTrader5 package: pip install MetaTrader5
@@ -12,7 +12,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,19 @@ PIP_SIZE = {
     "GBPUSD": 0.0001,
     "USDJPY": 0.01,
 }
+
+# APPROXIMATE retail pip values per 1.0 standard lot. These are fallbacks when
+# the MT5 symbol info isn't available (offline, mock, or misconfigured). In
+# production we read symbol_info.trade_tick_value / trade_tick_size from MT5.
+APPROX_PIP_VALUE_PER_LOT = {
+    "XAUUSD": 1.0,   # Approx; real value depends on broker contract size (usually 100 oz)
+    "USDJPY": 7.0,   # Approx; varies with USD/JPY price
+    "__DEFAULT__": 10.0,  # Approx for EURUSD/GBPUSD major pairs
+}
+
+# Common Exness symbol suffixes. Resolved at connect() time against
+# mt5.symbols_get() so we don't hard-code broker-specific naming.
+EXNESS_SUFFIX_CANDIDATES = ("", "m", "z", ".", ".m", "-m", "_m")
 
 
 @dataclass
@@ -59,6 +72,7 @@ class ExecutionResult:
     actual_sl: Optional[float]
     actual_tp: Optional[float]
     executed_at: Optional[str]
+    status: str = "EXECUTED"   # EXECUTED | PENDING_APPROVAL | NOTIFY | REJECTED
 
 
 class MT5Bridge:
@@ -69,13 +83,17 @@ class MT5Bridge:
 
     def __init__(self, mode: str = "CONFIRM"):
         """
-        mode: "CONFIRM" — requires Slack approval before execution (default)
-              "AUTO"    — executes immediately on signal
-              "NOTIFY"  — sends alert only, no execution
+        mode: "CONFIRM" — returns PENDING_APPROVAL result; an external approval
+                          surface (e.g. OpenClaw → Slack) must call submit_order()
+                          to actually send the trade.
+              "AUTO"    — executes immediately on signal.
+              "NOTIFY"  — sends alert only, no execution.
         """
         self.mode = mode
         self._mt5 = None
         self._connected = False
+        # instrument -> resolved broker symbol name (may differ from instrument)
+        self._symbol_cache: dict = {}
 
     def connect(
         self,
@@ -84,11 +102,7 @@ class MT5Bridge:
         server: Optional[str] = None,
         path: Optional[str] = None,
     ) -> bool:
-        """
-        Connect to MT5 terminal.
-        Credentials from args or environment variables:
-          MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH
-        """
+        """Connect to MT5 terminal. Credentials from args or environment."""
         try:
             import MetaTrader5 as mt5
             self._mt5 = mt5
@@ -140,12 +154,88 @@ class MT5Bridge:
     def count_open_positions(self, instrument: Optional[str] = None) -> int:
         if not self._connected:
             return 0
+        symbol = self.resolve_symbol(instrument) if instrument else None
         positions = (
-            self._mt5.positions_get(symbol=instrument)
-            if instrument
+            self._mt5.positions_get(symbol=symbol)
+            if symbol
             else self._mt5.positions_get()
         )
         return len(positions) if positions else 0
+
+    # ------------------------------------------------------------------
+    # Symbol resolution (Exness uses suffixed names like EURUSDm)
+    # ------------------------------------------------------------------
+
+    def resolve_symbol(self, instrument: str) -> str:
+        """
+        Resolve a PRISM instrument ID (e.g. "EURUSD") to the broker-specific
+        symbol name (e.g. "EURUSDm" for Exness retail). Falls back to the
+        original instrument string when not connected or no match is found.
+        """
+        if instrument in self._symbol_cache:
+            return self._symbol_cache[instrument]
+        if not self._connected or self._mt5 is None:
+            return instrument
+        try:
+            # Fast path: exact symbol exists
+            if self._mt5.symbol_info(instrument) is not None:
+                self._symbol_cache[instrument] = instrument
+                return instrument
+            # Try known suffix candidates
+            for suffix in EXNESS_SUFFIX_CANDIDATES:
+                candidate = f"{instrument}{suffix}"
+                if self._mt5.symbol_info(candidate) is not None:
+                    self._symbol_cache[instrument] = candidate
+                    logger.info(f"Resolved {instrument} → {candidate}")
+                    return candidate
+        except Exception as e:
+            logger.warning(f"Symbol resolution failed for {instrument}: {e}")
+        # No match — cache the raw name so we only log once
+        self._symbol_cache[instrument] = instrument
+        return instrument
+
+    def _pick_filling_mode(self, symbol: str):
+        """
+        Read symbol_info.filling_mode and return a compatible order filling flag.
+        filling_mode is a bitmask: bit 0 = FOK, bit 1 = IOC, bit 2 = RETURN.
+        Preference order: IOC -> FOK -> RETURN. Falls back to IOC if unknown.
+        """
+        mt5 = self._mt5
+        if mt5 is None:
+            return None
+        try:
+            info = mt5.symbol_info(symbol)
+            flags = getattr(info, "filling_mode", 0) if info is not None else 0
+            # SYMBOL_FILLING_FOK = 1, SYMBOL_FILLING_IOC = 2 per MT5 docs
+            if flags & 2:
+                return mt5.ORDER_FILLING_IOC
+            if flags & 1:
+                return mt5.ORDER_FILLING_FOK
+            return mt5.ORDER_FILLING_RETURN
+        except Exception:
+            return mt5.ORDER_FILLING_IOC
+
+    def _pip_value_per_lot(self, symbol: str, instrument: str) -> float:
+        """
+        Prefer live symbol_info.trade_tick_value / trade_tick_size when connected;
+        otherwise fall back to APPROX_PIP_VALUE_PER_LOT (retail approximation).
+        """
+        pip = PIP_SIZE.get(instrument, 0.0001)
+        if self._connected and self._mt5 is not None:
+            try:
+                info = self._mt5.symbol_info(symbol)
+                tick_value = getattr(info, "trade_tick_value", None) if info else None
+                tick_size = getattr(info, "trade_tick_size", None) if info else None
+                if tick_value and tick_size and tick_size > 0:
+                    return float(tick_value) * (pip / float(tick_size))
+            except Exception as e:
+                logger.debug(f"symbol_info lookup failed for {symbol}: {e}")
+        # Fallback: retail approximation
+        if instrument == "XAUUSD":
+            return APPROX_PIP_VALUE_PER_LOT["XAUUSD"]
+        if "JPY" in instrument:
+            return APPROX_PIP_VALUE_PER_LOT["USDJPY"]
+        return APPROX_PIP_VALUE_PER_LOT["__DEFAULT__"]
 
     def calculate_lot_size(
         self,
@@ -157,6 +247,10 @@ class MT5Bridge:
         """
         Risk-based lot sizing: risk 1% of balance on this trade.
         lot_size = (balance * risk_pct) / (sl_pips * pip_value_per_lot)
+
+        When connected to MT5, pip_value_per_lot is derived from
+        symbol_info.trade_tick_value / trade_tick_size. Offline we fall back to
+        APPROX_PIP_VALUE_PER_LOT — acceptable for v0; label trades accordingly.
         """
         pip = PIP_SIZE.get(instrument, 0.0001)
         sl_pips = abs(entry_price - sl_price) / pip
@@ -165,35 +259,61 @@ class MT5Bridge:
             return 0.0
 
         risk_amount = account_balance * RISK_PCT
-        # Standard lot pip value: $10/pip for majors, $7 for JPY, $1 for gold
-        if instrument == "XAUUSD":
-            pip_value_per_lot = 1.0
-        elif "JPY" in instrument:
-            pip_value_per_lot = 7.0
-        else:
-            pip_value_per_lot = 10.0
+        symbol = self.resolve_symbol(instrument)
+        pip_value_per_lot = self._pip_value_per_lot(symbol, instrument)
 
         lot = risk_amount / (sl_pips * pip_value_per_lot)
         lot = max(0.01, min(lot, 10.0))
         lot = round(lot, 2)
-        logger.info(f"Lot size: {lot} (risk={risk_amount:.2f}, sl={sl_pips:.1f} pips)")
+        logger.info(
+            f"Lot size: {lot} (risk={risk_amount:.2f}, sl={sl_pips:.1f} pips, "
+            f"pip_value={pip_value_per_lot:.4f}, symbol={symbol})"
+        )
         return lot
 
     def execute_signal(self, signal: SignalPacket) -> ExecutionResult:
-        """Execute a PRISM signal on MT5. Respects mode (CONFIRM/AUTO/NOTIFY)."""
+        """
+        Dispatch a signal according to the configured mode.
+
+        * NOTIFY   -> never executes; returns status=NOTIFY
+        * CONFIRM  -> returns status=PENDING_APPROVAL; caller must invoke
+                      submit_order(signal) after human/Slack confirmation.
+        * AUTO     -> calls submit_order(signal) immediately.
+        """
         if self.mode == "NOTIFY":
             logger.info(
                 f"NOTIFY mode: signal logged, not executed: {signal.instrument} {signal.direction}"
             )
             return ExecutionResult(
                 success=False, ticket=None, error="NOTIFY mode",
-                actual_entry=None, actual_sl=None, actual_tp=None, executed_at=None,
+                actual_entry=None, actual_sl=None, actual_tp=None,
+                executed_at=None, status="NOTIFY",
             )
 
+        if self.mode == "CONFIRM":
+            logger.info(
+                f"CONFIRM mode: awaiting approval for {signal.instrument} "
+                f"{signal.direction} @ {signal.entry}"
+            )
+            return ExecutionResult(
+                success=False, ticket=None, error=None,
+                actual_entry=None, actual_sl=None, actual_tp=None,
+                executed_at=None, status="PENDING_APPROVAL",
+            )
+
+        # AUTO
+        return self.submit_order(signal)
+
+    def submit_order(self, signal: SignalPacket) -> ExecutionResult:
+        """
+        Actually send the order to MT5. This is the approval surface that the
+        Slack/OpenClaw confirm handler calls after the user clicks "approve".
+        """
         if not self._connected:
             return ExecutionResult(
                 success=False, ticket=None, error="MT5 not connected",
-                actual_entry=None, actual_sl=None, actual_tp=None, executed_at=None,
+                actual_entry=None, actual_sl=None, actual_tp=None,
+                executed_at=None, status="REJECTED",
             )
 
         open_count = self.count_open_positions()
@@ -201,14 +321,16 @@ class MT5Bridge:
             return ExecutionResult(
                 success=False, ticket=None,
                 error=f"Max concurrent trades reached ({MAX_CONCURRENT})",
-                actual_entry=None, actual_sl=None, actual_tp=None, executed_at=None,
+                actual_entry=None, actual_sl=None, actual_tp=None,
+                executed_at=None, status="REJECTED",
             )
 
         if signal.confidence < 0.60:
             return ExecutionResult(
                 success=False, ticket=None,
                 error=f"Confidence too low: {signal.confidence:.2f}",
-                actual_entry=None, actual_sl=None, actual_tp=None, executed_at=None,
+                actual_entry=None, actual_sl=None, actual_tp=None,
+                executed_at=None, status="REJECTED",
             )
 
         mt5 = self._mt5
@@ -217,15 +339,18 @@ class MT5Bridge:
         if lot <= 0:
             return ExecutionResult(
                 success=False, ticket=None, error="Invalid lot size",
-                actual_entry=None, actual_sl=None, actual_tp=None, executed_at=None,
+                actual_entry=None, actual_sl=None, actual_tp=None,
+                executed_at=None, status="REJECTED",
             )
 
-        tick = mt5.symbol_info_tick(signal.instrument)
+        symbol = self.resolve_symbol(signal.instrument)
+        tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return ExecutionResult(
                 success=False, ticket=None,
-                error=f"No tick data for {signal.instrument}",
-                actual_entry=None, actual_sl=None, actual_tp=None, executed_at=None,
+                error=f"No tick data for {symbol}",
+                actual_entry=None, actual_sl=None, actual_tp=None,
+                executed_at=None, status="REJECTED",
             )
 
         order_type = mt5.ORDER_TYPE_BUY if signal.direction == "LONG" else mt5.ORDER_TYPE_SELL
@@ -233,7 +358,7 @@ class MT5Bridge:
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": signal.instrument,
+            "symbol": symbol,
             "volume": lot,
             "type": order_type,
             "price": price,
@@ -243,7 +368,7 @@ class MT5Bridge:
             "magic": MAGIC_NUMBER,
             "comment": f"PRISM_{signal.direction}_{signal.confidence:.2f}",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": self._pick_filling_mode(symbol),
         }
 
         result = mt5.order_send(request)
@@ -252,7 +377,8 @@ class MT5Bridge:
             logger.error(f"Order failed: {error}")
             return ExecutionResult(
                 success=False, ticket=None, error=error,
-                actual_entry=None, actual_sl=None, actual_tp=None, executed_at=None,
+                actual_entry=None, actual_sl=None, actual_tp=None,
+                executed_at=None, status="REJECTED",
             )
 
         logger.info(f"Order executed: ticket={result.order} price={result.price} lot={lot}")
@@ -264,6 +390,7 @@ class MT5Bridge:
             actual_sl=signal.sl,
             actual_tp=signal.tp2,
             executed_at=datetime.now(timezone.utc).isoformat(),
+            status="EXECUTED",
         )
 
     def close_position(self, ticket: int) -> bool:
@@ -287,6 +414,7 @@ class MT5Bridge:
             "deviation": 20,
             "magic": MAGIC_NUMBER,
             "comment": "PRISM_CLOSE",
+            "type_filling": self._pick_filling_mode(pos.symbol),
         }
         result = mt5.order_send(request)
         return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
@@ -309,7 +437,20 @@ class MockMT5Bridge(MT5Bridge):
     def count_open_positions(self, instrument=None) -> int:
         return 0
 
+    def resolve_symbol(self, instrument: str) -> str:
+        return instrument
+
+    def _pip_value_per_lot(self, symbol: str, instrument: str) -> float:
+        # Preserve the original (approximate) retail values for deterministic tests.
+        if instrument == "XAUUSD":
+            return APPROX_PIP_VALUE_PER_LOT["XAUUSD"]
+        if "JPY" in instrument:
+            return APPROX_PIP_VALUE_PER_LOT["USDJPY"]
+        return APPROX_PIP_VALUE_PER_LOT["__DEFAULT__"]
+
     def execute_signal(self, signal: SignalPacket) -> ExecutionResult:
+        # In mock we always simulate an executed trade (regardless of mode)
+        # so existing tests and backtests get deterministic outputs.
         logger.info(
             f"MockMT5Bridge: simulated execute {signal.instrument} {signal.direction} @ {signal.entry}"
         )
@@ -321,4 +462,8 @@ class MockMT5Bridge(MT5Bridge):
             actual_sl=signal.sl,
             actual_tp=signal.tp2,
             executed_at=datetime.now(timezone.utc).isoformat(),
+            status="EXECUTED",
         )
+
+    def submit_order(self, signal: SignalPacket) -> ExecutionResult:
+        return self.execute_signal(signal)
