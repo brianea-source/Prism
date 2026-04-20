@@ -260,8 +260,10 @@ class SlackNotifier:
             ts = resp["ts"]
             logger.info(f"Signal sent to Slack: {signal.instrument} {signal.direction} ts={ts}")
 
-            # Re-stamp the message with the real ts so any block references are correct.
-            if mode == "CONFIRM":
+            # Poll-mode blocks don't reference message_ts, so the post-then-
+            # update round-trip is pure overhead. Only webhook mode needs the
+            # second call because the button action values encode the real ts.
+            if mode == "CONFIRM" and use_buttons:
                 updated_blocks = self._format_confirm_blocks(
                     signal, ts,
                     use_buttons=use_buttons,

@@ -271,6 +271,15 @@ class TestSigtermHandler:
 # ===========================================================================
 
 class TestDailyBrief:
+    @pytest.fixture(autouse=True)
+    def _isolate_state_dir(self, tmp_path, monkeypatch):
+        """
+        Redirect PRISM_STATE_DIR to a throwaway tmp_path so the new
+        _save_last_brief_date side-effect doesn't pollute the repo's
+        ``state/`` directory across test runs.
+        """
+        monkeypatch.setenv("PRISM_STATE_DIR", str(tmp_path / "state"))
+
     def test_daily_brief_fires_once_per_day(self):
         """
         _maybe_send_daily_brief called twice at the same hour+date should
@@ -674,3 +683,258 @@ class TestRunnerWiring:
         raw = __import__("os").environ.get("PRISM_APPROVERS", "")
         approvers = {u.strip() for u in raw.split(",") if u.strip()} or None
         assert approvers is None
+
+
+# ===========================================================================
+# Follow-up 1: _last_brief_date persists across runner restarts
+# ===========================================================================
+
+class TestDailyBriefPersistence:
+    def test_save_and_load_round_trip(self, tmp_path, monkeypatch):
+        """Persisted date must round-trip through _save → _load."""
+        import prism.delivery.runner as runner_module
+        from datetime import date as _date
+
+        monkeypatch.setenv("PRISM_STATE_DIR", str(tmp_path / "state"))
+        runner_module._save_last_brief_date(_date(2026, 4, 20))
+        loaded = runner_module._load_last_brief_date()
+        assert loaded == _date(2026, 4, 20)
+
+    def test_load_returns_none_when_file_absent(self, tmp_path, monkeypatch):
+        """Missing state file must return None, not raise."""
+        import prism.delivery.runner as runner_module
+        monkeypatch.setenv("PRISM_STATE_DIR", str(tmp_path / "fresh"))
+        assert runner_module._load_last_brief_date() is None
+
+    def test_load_returns_none_on_corrupt_file(self, tmp_path, monkeypatch):
+        """A garbage state file must not crash startup — return None and log."""
+        import prism.delivery.runner as runner_module
+        state = tmp_path / "state"
+        state.mkdir()
+        (state / "last_brief_date.txt").write_text("not-a-date")
+        monkeypatch.setenv("PRISM_STATE_DIR", str(state))
+        assert runner_module._load_last_brief_date() is None
+
+    def test_maybe_send_brief_persists_date(self, tmp_path, monkeypatch):
+        """
+        When _maybe_send_daily_brief fires, the date must be written to disk
+        so a subsequent process load sees it and doesn't re-fire.
+        """
+        import prism.delivery.runner as runner_module
+        from datetime import date as _date
+
+        monkeypatch.setenv("PRISM_STATE_DIR", str(tmp_path / "state"))
+        runner_module._last_brief_date = None
+
+        mock_notifier = MagicMock()
+        stats = {"signals_fired": 2}
+        now = datetime(2026, 4, 20, 22, 0, tzinfo=timezone.utc)
+
+        runner_module._maybe_send_daily_brief(mock_notifier, stats, now)
+
+        # First call fired the brief…
+        assert mock_notifier.send_daily_brief.call_count == 1
+        # …and the date is now on disk.
+        assert runner_module._load_last_brief_date() == _date(2026, 4, 20)
+
+    def test_restart_does_not_re_fire_brief_same_day(self, tmp_path, monkeypatch):
+        """
+        Simulate a restart: pre-populate the state file, reset the module
+        global, then trigger _maybe_send_daily_brief at 22:00 on the same
+        day. send_daily_brief MUST NOT be called.
+        """
+        import prism.delivery.runner as runner_module
+        from datetime import date as _date
+
+        state = tmp_path / "state"
+        state.mkdir()
+        (state / "last_brief_date.txt").write_text(_date(2026, 4, 20).isoformat())
+        monkeypatch.setenv("PRISM_STATE_DIR", str(state))
+
+        # Fresh process view: load from disk as run() does at startup.
+        runner_module._last_brief_date = runner_module._load_last_brief_date()
+        assert runner_module._last_brief_date == _date(2026, 4, 20)
+
+        mock_notifier = MagicMock()
+        now = datetime(2026, 4, 20, 22, 0, tzinfo=timezone.utc)
+        runner_module._maybe_send_daily_brief(mock_notifier, {}, now)
+
+        assert mock_notifier.send_daily_brief.call_count == 0, \
+            "Brief must not re-fire after restart on the same day"
+
+    def test_state_dir_in_gitignore(self):
+        """state/ must be gitignored so runtime writes never hit the repo."""
+        import pathlib
+        root = pathlib.Path(__file__).parent.parent
+        lines = [l.strip() for l in (root / ".gitignore").read_text().splitlines()]
+        assert "state/" in lines, "state/ directory must be listed in .gitignore"
+
+
+# ===========================================================================
+# Follow-up 2: PollConfirmHandler.wait short-circuits on shutdown
+# ===========================================================================
+
+class TestConfirmShutdown:
+    def test_should_stop_aborts_immediately(self, monkeypatch):
+        """
+        When should_stop() returns True, wait() must return SHUTDOWN without
+        calling Slack — a signal caught at the top of the first poll cycle.
+        """
+        import prism.delivery.confirm_handler as ch
+
+        class _NeverCalled:
+            def reactions_get(self, **_):
+                raise AssertionError("reactions_get must not be called after shutdown")
+
+        handler = ch.PollConfirmHandler(_NeverCalled(), "#ch", "ts-s1")
+        monkeypatch.setattr(ch.time_module, "sleep", lambda _s: None)
+        monkeypatch.setattr(ch.time_module, "time", lambda: 0.0)
+
+        result = handler.wait(
+            timeout_sec=300,
+            poll_interval_sec=0,
+            should_stop=lambda: True,
+        )
+        assert result == ch.ConfirmationResult.SHUTDOWN
+
+    def test_should_stop_triggered_during_sleep(self, monkeypatch):
+        """
+        Shutdown raised mid-sleep must abort within one second instead of
+        blocking for the full poll interval.
+        """
+        import prism.delivery.confirm_handler as ch
+
+        class _EmptyReactions:
+            def reactions_get(self, **_):
+                return {"message": {"reactions": []}}
+
+        handler = ch.PollConfirmHandler(_EmptyReactions(), "#ch", "ts-s2")
+
+        # Flip the flag after the FIRST sleep chunk (runner typically sleeps
+        # for >=1 second between polls). The interruptible sleep should
+        # notice and bail out.
+        call_count = {"n": 0}
+        flag = {"stop": False}
+
+        def fake_sleep(_s):
+            call_count["n"] += 1
+            if call_count["n"] >= 1:
+                flag["stop"] = True
+
+        monkeypatch.setattr(ch.time_module, "sleep", fake_sleep)
+        monkeypatch.setattr(ch.time_module, "time", _fake_clock([0.0, 0.5, 1.0, 2.0]))
+
+        result = handler.wait(
+            timeout_sec=300,
+            poll_interval_sec=5,
+            should_stop=lambda: flag["stop"],
+        )
+        assert result == ch.ConfirmationResult.SHUTDOWN
+        # At most a couple of sleep chunks before shutdown was noticed —
+        # definitely not 5 full seconds.
+        assert call_count["n"] <= 2
+
+    def test_should_stop_false_does_not_interfere(self, monkeypatch):
+        """A should_stop that always returns False must behave like the old API."""
+        import prism.delivery.confirm_handler as ch
+
+        reactions = [{"name": "white_check_mark", "users": ["U1"], "count": 1}]
+
+        class _Client:
+            def reactions_get(self, **_):
+                return {"message": {"reactions": reactions}}
+
+        handler = ch.PollConfirmHandler(_Client(), "#ch", "ts-s3")
+        monkeypatch.setattr(ch.time_module, "sleep", lambda _s: None)
+        monkeypatch.setattr(ch.time_module, "time", _fake_clock([0.0, 0.5]))
+
+        result = handler.wait(
+            timeout_sec=10,
+            poll_interval_sec=0,
+            should_stop=lambda: False,
+        )
+        assert result == ch.ConfirmationResult.CONFIRMED
+
+    def test_shutdown_result_constant_exists(self):
+        """Public SHUTDOWN constant must exist on ConfirmationResult."""
+        from prism.delivery.confirm_handler import ConfirmationResult
+        assert ConfirmationResult.SHUTDOWN == "SHUTDOWN"
+
+    def test_runner_threads_shutdown_predicate(self):
+        """Runner must pass should_stop=lambda: _shutdown to handler.wait."""
+        import inspect
+        import prism.delivery.runner as runner_module
+        src = inspect.getsource(runner_module._scan_instrument)
+        assert "should_stop=lambda: _shutdown" in src, \
+            "runner._scan_instrument must thread _shutdown into handler.wait"
+
+
+# ===========================================================================
+# Follow-up 3: send_signal collapses to one Slack call in poll mode
+# ===========================================================================
+
+class _RecordingClient:
+    """Records chat_postMessage + chat_update calls; returns a fixed ts."""
+    def __init__(self):
+        self.posts = []
+        self.updates = []
+
+    def chat_postMessage(self, **kwargs):
+        self.posts.append(kwargs)
+        return {"ts": "1700000000.000001"}
+
+    def chat_update(self, **kwargs):
+        self.updates.append(kwargs)
+        return {"ok": True}
+
+
+class TestSendSignalSingleCall:
+    def _notifier_with_client(self, client):
+        from prism.delivery.slack_notifier import SlackNotifier
+        notifier = SlackNotifier(token=None, channel="#test")
+        # Bypass the "no token" short-circuit by swapping in the recorder.
+        notifier.client = client
+        return notifier
+
+    def test_poll_mode_posts_once(self):
+        """use_buttons=False must make exactly one Slack call (post, no update)."""
+        client = _RecordingClient()
+        notifier = self._notifier_with_client(client)
+        signal = _make_signal()
+
+        ts = notifier.send_signal(signal, mode="CONFIRM", use_buttons=False)
+
+        assert ts == "1700000000.000001"
+        assert len(client.posts) == 1, "CONFIRM poll mode must post once"
+        assert len(client.updates) == 0, \
+            "CONFIRM poll mode must NOT call chat_update (nothing references the ts)"
+
+    def test_webhook_mode_posts_then_updates(self):
+        """use_buttons=True still needs the two-call dance (buttons encode ts)."""
+        client = _RecordingClient()
+        notifier = self._notifier_with_client(client)
+        signal = _make_signal()
+
+        notifier.send_signal(signal, mode="CONFIRM", use_buttons=True)
+
+        assert len(client.posts) == 1
+        assert len(client.updates) == 1, \
+            "Webhook mode must still re-stamp the message so button values point at the real ts"
+        # Verify the update's blocks reference the real ts, not the "pending"
+        # placeholder used in the initial post.
+        actions = [b for b in client.updates[0]["blocks"] if b.get("type") == "actions"]
+        assert actions, "Webhook update must contain an actions block"
+        values = [e.get("value") for e in actions[0]["elements"]]
+        assert "1700000000.000001" in values, \
+            "Button values must be updated to the real Slack ts"
+
+    def test_notify_mode_posts_once(self):
+        """NOTIFY mode never needed the update either; assert it stays one-shot."""
+        client = _RecordingClient()
+        notifier = self._notifier_with_client(client)
+        signal = _make_signal()
+
+        notifier.send_signal(signal, mode="NOTIFY")
+
+        assert len(client.posts) == 1
+        assert len(client.updates) == 0

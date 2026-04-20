@@ -36,3 +36,6 @@ logs/
 # PRISM model artifacts (joblib, pkl, json) — except .gitkeep
 models/*.json
 !models/.gitkeep
+
+# PRISM runtime state (daily-brief guard, etc.)
+state/
