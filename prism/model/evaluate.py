@@ -49,9 +49,10 @@ def backtest_signals(
     """
     pip_size = 0.01 if any(x in instrument for x in ["XAU", "JPY"]) else 0.0001
 
-    assert len(df) >= len(signals), (
-        f"df has {len(df)} rows but {len(signals)} signals provided"
-    )
+    if len(df) < len(signals):
+        raise ValueError(
+            f"df has {len(df)} rows but {len(signals)} signals provided"
+        )
 
     balance = initial_balance
     equity_curve: list[float] = [balance]

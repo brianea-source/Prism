@@ -62,7 +62,6 @@ def test_xgb_trains_and_predicts():
     model = XGBClassifier(
         n_estimators=50,
         max_depth=3,
-        use_label_encoder=False,
         eval_metric="mlogloss",
         random_state=42,
         n_jobs=1,
@@ -156,7 +155,6 @@ def test_overfit_detection():
         n_estimators=200,
         max_depth=8,
         learning_rate=0.3,
-        use_label_encoder=False,
         eval_metric="mlogloss",
         random_state=99,
         n_jobs=1,

@@ -58,15 +58,18 @@ def _map_labels(y: pd.Series) -> pd.Series:
     return y.map(DIRECTION_MAP).fillna(1).astype(int)
 
 
-def _build_confidence_labels(y_true: pd.Series, y_pred: np.ndarray) -> np.ndarray:
+def _build_confidence_labels(proba: np.ndarray) -> np.ndarray:
     """
-    Derive a 3-tier confidence label (2=high, 1=medium, 0=low) for Layer 3.
-    Uses rolling correctness + distance from decision boundary on layer1.
+    Derive a 3-tier confidence label from XGB class probabilities.
+    Uses prediction entropy — fully available at inference, no ground-truth needed.
+
+    entropy = -sum(p * log(p + 1e-9))  per row
+    HIGH (2): entropy < 0.5
+    MED  (1): entropy < 0.9
+    LOW  (0): else
     """
-    correct = (y_true.values == y_pred).astype(int)
-    # rolling 5-bar hit rate → tier
-    hits = pd.Series(correct).rolling(5, min_periods=1).mean().values
-    labels = np.where(hits >= 0.7, 2, np.where(hits >= 0.4, 1, 0))
+    entropy = -np.sum(proba * np.log(proba + 1e-9), axis=1)
+    labels = np.where(entropy < 0.5, 2, np.where(entropy < 0.9, 1, 0))
     return labels.astype(int)
 
 
@@ -98,15 +101,6 @@ def _run_shap(model, X: pd.DataFrame, instrument: str, layer: str) -> None:
         logger.warning(f"SHAP analysis skipped: {e}")
 
 
-def _cv_accuracy(model, X: np.ndarray, y: np.ndarray) -> float:
-    """Walk-forward cross-validation mean accuracy with TimeSeriesSplit."""
-    tscv = TimeSeriesSplit(n_splits=N_CV_SPLITS)
-    scores = []
-    for train_idx, val_idx in tscv.split(X):
-        model.fit(X[train_idx], y[train_idx])
-        preds = model.predict(X[val_idx])
-        scores.append(accuracy_score(y[val_idx], preds))
-    return float(np.mean(scores))
 
 
 # ---------------------------------------------------------------------------
@@ -211,15 +205,17 @@ class PRISMTrainer:
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            use_label_encoder=False,
             eval_metric="mlogloss",
             num_class=3,
             random_state=42,
             n_jobs=-1,
         )
+        val_size = max(1, int(len(X_train) * 0.15))
+        X_tr, X_val = X_train[:-val_size], X_train[-val_size:]
+        y_tr, y_val = y_train[:-val_size], y_train[-val_size:]
         model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
             verbose=False,
         )
         train_pred = model.predict(X_train)
@@ -263,9 +259,12 @@ class PRISMTrainer:
             n_jobs=-1,
             verbose=-1,
         )
+        val_size = max(1, int(len(X_train) * 0.15))
+        X_tr, X_val = X_train[:-val_size], X_train[-val_size:]
+        y_tr, y_val = y_train[:-val_size], y_train[-val_size:]
         model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
         )
         train_pred = model.predict(X_train)
         test_pred = model.predict(X_test)
@@ -305,9 +304,12 @@ class PRISMTrainer:
             random_state=42,
             n_jobs=-1,
         )
+        val_size = max(1, int(len(X_train) * 0.15))
+        X_tr, X_val = X_train[:-val_size], X_train[-val_size:]
+        y_tr, y_val = y_train[:-val_size], y_train[-val_size:]
         model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
             verbose=False,
         )
         train_pred = model.predict(X_train)
@@ -345,11 +347,11 @@ class PRISMTrainer:
         xgb_path = MODELS_DIR / f"layer1_xgb_{self.instrument}.joblib"
         xgb_model = joblib.load(xgb_path)
 
-        train_preds = xgb_model.predict(X_train)
-        test_preds = xgb_model.predict(X_test)
+        train_proba = xgb_model.predict_proba(X_train)
+        test_proba = xgb_model.predict_proba(X_test)
 
-        conf_train = _build_confidence_labels(pd.Series(y_train), train_preds)
-        conf_test = _build_confidence_labels(pd.Series(y_test), test_preds)
+        conf_train = _build_confidence_labels(train_proba)
+        conf_test = _build_confidence_labels(test_proba)
 
         model = RandomForestClassifier(
             n_estimators=200,
