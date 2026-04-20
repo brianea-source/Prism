@@ -220,27 +220,95 @@ class MT5Bridge:
         except Exception:
             return mt5.ORDER_FILLING_IOC
 
-    def _pip_value_per_lot(self, symbol: str, instrument: str) -> float:
+    def _pip_value_from_symbol_info(self, symbol: str, instrument: str) -> Optional[float]:
         """
-        Prefer live symbol_info.trade_tick_value / trade_tick_size when connected;
-        otherwise fall back to APPROX_PIP_VALUE_PER_LOT (retail approximation).
+        Compute pip value per 1.0 lot from live MT5 ``symbol_info``, in the
+        **account** currency.
+
+        Field priority (MT5 semantics):
+            1. ``trade_tick_value_loss``  — tick value on losing positions,
+               already converted to account currency. Preferred because
+               risk sizing is fundamentally a loss-side calculation (we're
+               dimensioning the position against the distance to SL).
+            2. ``trade_tick_value``       — canonical tick value, account
+               currency on most brokers. Fallback if *_loss is absent or 0.
+            3. ``trade_tick_value_profit``— tick value on winning positions.
+               Last resort; differs from *_loss by swap costs on some
+               brokers.
+
+        Returns ``None`` when no usable tick data is available so the caller
+        can decide whether to fail closed (production) or fall back to the
+        retail approximation (explicit opt-in).
         """
-        pip = PIP_SIZE.get(instrument, 0.0001)
-        if self._connected and self._mt5 is not None:
-            try:
-                info = self._mt5.symbol_info(symbol)
-                tick_value = getattr(info, "trade_tick_value", None) if info else None
-                tick_size = getattr(info, "trade_tick_size", None) if info else None
-                if tick_value and tick_size and tick_size > 0:
-                    return float(tick_value) * (pip / float(tick_size))
-            except Exception as e:
-                logger.debug(f"symbol_info lookup failed for {symbol}: {e}")
-        # Fallback: retail approximation
+        if not (self._connected and self._mt5 is not None):
+            return None
+        try:
+            info = self._mt5.symbol_info(symbol)
+        except Exception as e:
+            logger.debug(f"symbol_info lookup failed for {symbol}: {e}")
+            return None
+        if info is None:
+            return None
+
+        tick_size = getattr(info, "trade_tick_size", None)
+        if not tick_size or tick_size <= 0:
+            return None
+
+        # Try the three tick-value fields in priority order. Any field that
+        # exists AND is > 0 wins. A broker that reports trade_tick_value=0
+        # is typically misconfigured; we skip rather than produce a nonsense
+        # divide-by-zero downstream.
+        for field_name in (
+            "trade_tick_value_loss",
+            "trade_tick_value",
+            "trade_tick_value_profit",
+        ):
+            tick_value = getattr(info, field_name, None)
+            if tick_value and float(tick_value) > 0:
+                pip = PIP_SIZE.get(instrument, 0.0001)
+                pip_value = float(tick_value) * (pip / float(tick_size))
+                logger.debug(
+                    f"symbol_info pip value for {symbol}: {pip_value:.4f} "
+                    f"(source={field_name}, tick_value={tick_value}, tick_size={tick_size})"
+                )
+                return pip_value
+        return None
+
+    def _approx_pip_value_per_lot(self, instrument: str) -> float:
+        """Retail approximation — used only when opted in or in Mock bridge."""
         if instrument == "XAUUSD":
             return APPROX_PIP_VALUE_PER_LOT["XAUUSD"]
         if "JPY" in instrument:
             return APPROX_PIP_VALUE_PER_LOT["USDJPY"]
         return APPROX_PIP_VALUE_PER_LOT["__DEFAULT__"]
+
+    def _pip_value_per_lot(self, symbol: str, instrument: str) -> tuple:
+        """
+        Resolve the pip value per lot + the source label for audit logging.
+
+        Returns:
+            (pip_value, source) where ``source`` is one of:
+                * ``"symbol_info"`` — derived from live MT5 tick data
+                * ``"approximation"`` — retail fallback (off-target by
+                  ~10-20% on XAUUSD / JPY pairs)
+                * ``"unavailable"`` — no source; caller MUST reject the trade
+
+        ``calculate_lot_size`` interprets ``"unavailable"`` as a hard reject
+        unless ``PRISM_ALLOW_APPROX_PIP_VALUE=1`` is set (explicit opt-in for
+        demo/dev). In production on a live MT5, symbol_info is always
+        available; the reject is the correct behaviour when it isn't.
+        """
+        live = self._pip_value_from_symbol_info(symbol, instrument)
+        if live is not None:
+            return live, "symbol_info"
+        # Connected bridges are expected to return from symbol_info; if they
+        # didn't, the broker-symbol mapping is probably broken. Don't smuggle
+        # an approximation into live trading.
+        if self._connected:
+            return 0.0, "unavailable"
+        # Disconnected: fall back to approximation. This is the demo/unit-
+        # test path; the runner flags the trade as demo in Slack.
+        return self._approx_pip_value_per_lot(instrument), "approximation"
 
     def calculate_lot_size(
         self,
@@ -250,12 +318,16 @@ class MT5Bridge:
         account_balance: float,
     ) -> float:
         """
-        Risk-based lot sizing: risk 1% of balance on this trade.
-        lot_size = (balance * risk_pct) / (sl_pips * pip_value_per_lot)
+        Risk-based lot sizing: risk RISK_PCT of balance on this trade.
+            lot_size = (balance * risk_pct) / (sl_pips * pip_value_per_lot)
 
-        When connected to MT5, pip_value_per_lot is derived from
-        symbol_info.trade_tick_value / trade_tick_size. Offline we fall back to
-        APPROX_PIP_VALUE_PER_LOT — acceptable for v0; label trades accordingly.
+        Production path uses ``symbol_info.trade_tick_value_loss`` (account
+        currency, loss-side — the correct basis for risk). When symbol_info
+        returns nothing on a connected bridge, the trade is REJECTED (lot=0)
+        unless ``PRISM_ALLOW_APPROX_PIP_VALUE=1`` is set. The retail
+        approximation is up to 20% off on XAUUSD and JPY-quoted pairs, so
+        silent fallback on a live account would mean mis-sized real-money
+        trades — we make that explicit rather than convenient.
         """
         pip = PIP_SIZE.get(instrument, 0.0001)
         sl_pips = abs(entry_price - sl_price) / pip
@@ -265,14 +337,35 @@ class MT5Bridge:
 
         risk_amount = account_balance * RISK_PCT
         symbol = self.resolve_symbol(instrument)
-        pip_value_per_lot = self._pip_value_per_lot(symbol, instrument)
+        pip_value_per_lot, source = self._pip_value_per_lot(symbol, instrument)
+
+        if source == "unavailable":
+            allow_approx = os.environ.get("PRISM_ALLOW_APPROX_PIP_VALUE", "0") == "1"
+            if not allow_approx:
+                logger.error(
+                    "No symbol_info for %s (resolved=%s). Refusing to lot-size "
+                    "from retail approximation on a live bridge. Set "
+                    "PRISM_ALLOW_APPROX_PIP_VALUE=1 to override (demo only).",
+                    instrument, symbol,
+                )
+                return 0.0
+            # Explicit opt-in — fall through to the approximation.
+            pip_value_per_lot = self._approx_pip_value_per_lot(instrument)
+            source = "approximation-forced"
+
+        if pip_value_per_lot <= 0:
+            logger.error(
+                "Non-positive pip value for %s (source=%s) — rejecting",
+                instrument, source,
+            )
+            return 0.0
 
         lot = risk_amount / (sl_pips * pip_value_per_lot)
         lot = max(0.01, min(lot, 10.0))
         lot = round(lot, 2)
         logger.info(
-            f"Lot size: {lot} (risk={risk_amount:.2f}, sl={sl_pips:.1f} pips, "
-            f"pip_value={pip_value_per_lot:.4f}, symbol={symbol})"
+            "Lot size: %s (risk=%.2f, sl=%.1f pips, pip_value=%.4f, symbol=%s, source=%s)",
+            lot, risk_amount, sl_pips, pip_value_per_lot, symbol, source,
         )
         return lot
 
@@ -450,13 +543,14 @@ class MockMT5Bridge(MT5Bridge):
     def resolve_symbol(self, instrument: str) -> str:
         return instrument
 
-    def _pip_value_per_lot(self, symbol: str, instrument: str) -> float:
-        # Preserve the original (approximate) retail values for deterministic tests.
-        if instrument == "XAUUSD":
-            return APPROX_PIP_VALUE_PER_LOT["XAUUSD"]
-        if "JPY" in instrument:
-            return APPROX_PIP_VALUE_PER_LOT["USDJPY"]
-        return APPROX_PIP_VALUE_PER_LOT["__DEFAULT__"]
+    def _pip_value_per_lot(self, symbol: str, instrument: str) -> tuple:
+        """
+        Mock bridge always reports the retail approximation as the source.
+        Matches the parent (value, source) contract so calculate_lot_size
+        doesn't need to special-case the mock — it just sees source=
+        "approximation" and sizes the trade without rejecting.
+        """
+        return self._approx_pip_value_per_lot(instrument), "approximation"
 
     def execute_signal(self, signal: SignalPacket) -> ExecutionResult:
         # In mock we always simulate an executed trade (regardless of mode)
