@@ -22,7 +22,8 @@ import logging
 import os
 import signal as signal_module
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 logging.basicConfig(
@@ -46,8 +47,46 @@ def _handle_sigterm(signum, frame):
 
 # ---------------------------------------------------------------------------
 # Daily brief tracking
+#
+# _last_brief_date is persisted under ``PRISM_STATE_DIR`` (default: ``state/``)
+# so a runner restart mid-day doesn't re-fire the 22:00 UTC brief a second
+# time. The persistence is best-effort — if the directory is read-only we
+# fall back to in-memory state and log a warning (still correct within a
+# single process lifetime, which is the 99% case).
 # ---------------------------------------------------------------------------
-_last_brief_date = None
+_last_brief_date: Optional[date] = None
+
+
+def _state_dir() -> Path:
+    """Resolve the directory where runner state is persisted."""
+    return Path(os.environ.get("PRISM_STATE_DIR", "state"))
+
+
+def _brief_state_file() -> Path:
+    return _state_dir() / "last_brief_date.txt"
+
+
+def _load_last_brief_date() -> Optional[date]:
+    """Read the persisted last-brief date, if any. Silent on error."""
+    path = _brief_state_file()
+    try:
+        if path.exists():
+            raw = path.read_text().strip()
+            if raw:
+                return date.fromisoformat(raw)
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not load last_brief_date from %s: %s", path, exc)
+    return None
+
+
+def _save_last_brief_date(d: date) -> None:
+    """Persist the last-brief date. Best-effort — logs on failure."""
+    path = _brief_state_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(d.isoformat())
+    except OSError as exc:
+        logger.warning("Could not persist last_brief_date to %s: %s", path, exc)
 
 
 def _maybe_send_daily_brief(notifier, stats_accumulator: dict, now: datetime) -> None:
@@ -56,6 +95,7 @@ def _maybe_send_daily_brief(notifier, stats_accumulator: dict, now: datetime) ->
     if now.hour == 22 and _last_brief_date != now.date():
         notifier.send_daily_brief(stats_accumulator)
         _last_brief_date = now.date()
+        _save_last_brief_date(_last_brief_date)
         stats_accumulator.clear()
 
 
@@ -197,8 +237,13 @@ def _scan_instrument(
         )
         # Honour PRISM_CONFIRM_TIMEOUT_SEC set on the notifier so the Slack
         # context block ("auto-expires in N min") and the actual wait stay
-        # in sync.
-        result = handler.wait(timeout_sec=notifier.confirm_timeout_sec)
+        # in sync. ``should_stop`` is read on every poll + every sleep-second
+        # so SIGTERM during a pending confirm aborts in under a second
+        # instead of blocking for the full timeout.
+        result = handler.wait(
+            timeout_sec=notifier.confirm_timeout_sec,
+            should_stop=lambda: _shutdown,
+        )
 
         if result == ConfirmationResult.CONFIRMED:
             notifier.update_signal_status(ts, "CONFIRMED", signal)
@@ -215,6 +260,14 @@ def _scan_instrument(
         elif result == ConfirmationResult.SKIPPED:
             notifier.update_signal_status(ts, "SKIPPED", signal)
             stats["skipped"] = stats.get("skipped", 0) + 1
+
+        elif result == ConfirmationResult.SHUTDOWN:
+            # Treat like SKIPPED but annotate the Slack message so operators
+            # can tell the difference between "user declined" and "PRISM was
+            # stopping". No MT5 execution in either case.
+            notifier.update_signal_status(ts, "SKIPPED", signal)
+            stats["skipped"] = stats.get("skipped", 0) + 1
+            logger.info("%s: Signal dropped — runner shutting down", instrument)
 
         else:  # EXPIRED
             notifier.update_signal_status(ts, "EXPIRED", signal)
@@ -265,6 +318,17 @@ def run() -> None:
 
     # Stats accumulator — cleared after each daily brief
     stats: dict = {}
+
+    # Rehydrate the daily-brief guard from disk so a restart mid-day (crash,
+    # deploy, etc.) doesn't double-send the 22:00 UTC summary.
+    global _last_brief_date
+    _last_brief_date = _load_last_brief_date()
+    if _last_brief_date is not None:
+        logger.info(
+            "Loaded last_brief_date=%s from %s — brief will not re-fire today",
+            _last_brief_date.isoformat(),
+            _brief_state_file(),
+        )
 
     logger.info(
         "PRISM runner started | instruments=%s | mode=%s | scan_interval=%ds | approvers=%s",

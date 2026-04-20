@@ -8,7 +8,7 @@ Slack Interactivity requires a public endpoint (ngrok or VPS URL).
 """
 import logging
 import time as time_module
-from typing import Iterable, Optional, Set, Tuple
+from typing import Callable, Iterable, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,11 @@ class ConfirmationResult:
     CONFIRMED = "CONFIRMED"
     SKIPPED = "SKIPPED"
     EXPIRED = "EXPIRED"
+    # Signalled when the runner's graceful-shutdown flag trips while we're
+    # polling. Callers should treat it like SKIPPED (don't execute) but can
+    # annotate the Slack message differently so operators know the signal
+    # was dropped because PRISM was stopping, not because nobody reviewed it.
+    SHUTDOWN = "SHUTDOWN"
 
 
 class PollConfirmHandler:
@@ -68,9 +73,21 @@ class PollConfirmHandler:
         users = reaction.get("users") or []
         return any(u in self.approvers for u in users)
 
-    def wait(self, timeout_sec: int = 300, poll_interval_sec: int = 10) -> str:
+    def wait(
+        self,
+        timeout_sec: int = 300,
+        poll_interval_sec: int = 10,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> str:
         """
         Block until an authorised confirm/skip reaction is added, or timeout.
+
+        should_stop: optional zero-arg predicate checked between polls AND
+            during the sleep interval. When it returns True, we abort early
+            and return ``ConfirmationResult.SHUTDOWN``. The runner wires
+            this to its ``_shutdown`` flag so SIGTERM during a pending
+            confirmation doesn't block for up to ``timeout_sec``.
+
         Returns a ConfirmationResult constant.
         """
         deadline = time_module.time() + timeout_sec
@@ -82,6 +99,10 @@ class PollConfirmHandler:
         )
 
         while time_module.time() < deadline:
+            if should_stop and should_stop():
+                logger.info("Signal confirmation aborted — shutdown requested")
+                return ConfirmationResult.SHUTDOWN
+
             try:
                 resp = self.client.reactions_get(
                     channel=self.channel,
@@ -99,7 +120,16 @@ class PollConfirmHandler:
             except Exception as exc:
                 logger.warning(f"Reaction poll error: {exc}")
 
-            time_module.sleep(poll_interval_sec)
+            # Interruptible sleep: check should_stop every second so SIGTERM
+            # cuts the wait even if poll_interval_sec is 10+ seconds.
+            remaining = poll_interval_sec
+            while remaining > 0:
+                if should_stop and should_stop():
+                    logger.info("Signal confirmation aborted — shutdown requested")
+                    return ConfirmationResult.SHUTDOWN
+                chunk = min(1, remaining)
+                time_module.sleep(chunk)
+                remaining -= chunk
 
         logger.info("Signal EXPIRED -- no action in timeout window")
         return ConfirmationResult.EXPIRED
