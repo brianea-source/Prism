@@ -32,3 +32,7 @@ models/*.joblib
 # Logs
 logs/
 *.log
+
+# PRISM model artifacts (joblib, pkl, json) — except .gitkeep
+models/*.json
+!models/.gitkeep
