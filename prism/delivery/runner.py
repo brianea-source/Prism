@@ -204,6 +204,7 @@ def _scan_instrument(
     now: datetime,
     stats: dict = None,
     approvers: Optional[set] = None,
+    guard=None,
 ) -> None:
     """Scan one instrument, generate a signal if conditions are met, deliver to Slack."""
     import pandas as pd
@@ -214,6 +215,24 @@ def _scan_instrument(
 
     if stats is None:
         stats = {}
+
+    # -- Drawdown guard gate --
+    # Refresh first (may reset into a new UTC day, may sync MT5 deals).
+    # If tripped, send a one-shot Slack alert and skip signal generation.
+    # We deliberately check this BEFORE any bar fetching so a halted PRISM
+    # doesn't hammer the data provider for work it will ignore.
+    if guard is not None:
+        guard.refresh(now)
+        if guard.is_tripped:
+            if guard.needs_notification:
+                ts = notifier.send_alert(guard.format_alert())
+                if ts is not None or getattr(notifier, "client", None) is None:
+                    guard.mark_notified()
+            logger.info(
+                "%s: Drawdown guard tripped — skipping (realized=$%.2f)",
+                instrument, guard.snapshot.get("realized_pnl_usd", 0.0),
+            )
+            return
 
     # -- Data loading --
     # Live-bar path when the bridge is connected to MT5; cache-backed alias
@@ -408,6 +427,14 @@ def run() -> None:
     notifier = SlackNotifier()
     bridge = _build_bridge(execution_mode)
 
+    # Daily drawdown kill-switch. Halts new entries once realized loss for
+    # the current UTC day exceeds PRISM_MAX_DAILY_LOSS_PCT (default 3% of
+    # start-of-day balance) OR PRISM_MAX_DAILY_LOSS_USD (optional absolute
+    # cap). State persists under PRISM_STATE_DIR so a restart doesn't
+    # reset the counter and re-enable trading after a halt.
+    from prism.delivery.drawdown_guard import build_guard_from_env
+    guard = build_guard_from_env(bridge, state_dir=_state_dir())
+
     # Stats accumulator — cleared after each daily brief
     stats: dict = {}
 
@@ -448,6 +475,7 @@ def run() -> None:
                 _scan_instrument(
                     instrument, notifier, bridge, now, stats,
                     approvers=approvers,
+                    guard=guard,
                 )
             except Exception as exc:
                 logger.error("Error scanning %s: %s", instrument, exc, exc_info=True)
