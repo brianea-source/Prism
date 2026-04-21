@@ -576,14 +576,21 @@ class TestDemoWarning:
 
     def test_runner_forwards_demo_warning(self):
         """
-        Runner's scan path must pass the module-level _DEMO_WARNING into
-        notifier.send_signal so the banner actually reaches Slack.
+        Runner's scan path must route _DEMO_WARNING into notifier.send_signal
+        on the demo/aliased-bars branch. Phase 4 made this conditional — the
+        banner only fires when the bridge does NOT support live bars — so we
+        verify (a) the constant is still defined, (b) it is assigned to the
+        local ``demo_warning`` on the else branch, and (c) that local is
+        threaded through to send_signal.
         """
         import prism.delivery.runner as runner_module
         import inspect
+        assert hasattr(runner_module, "_DEMO_WARNING")
         src = inspect.getsource(runner_module._scan_instrument)
-        assert "demo_warning=_DEMO_WARNING" in src, \
-            "runner._scan_instrument must pass demo_warning=_DEMO_WARNING to send_signal"
+        assert "demo_warning = _DEMO_WARNING" in src, \
+            "Demo path must assign demo_warning = _DEMO_WARNING"
+        assert "demo_warning=demo_warning" in src, \
+            "runner._scan_instrument must pass demo_warning=demo_warning to send_signal"
 
 
 # ===========================================================================

@@ -155,12 +155,46 @@ def _resolve_cache_paths(instrument: str, timeframe: str) -> list:
 # Per-instrument scan
 # ---------------------------------------------------------------------------
 
-# Shown on every signal while the runner is feeding H4 bars into the M5 slot.
-# Flip off once Phase 4 wires real live bars from MT5.
+# Shown on every signal while the runner is falling back to H4 bars aliased
+# as H1/M5 — i.e. when the bridge doesn't support live bars (MockMT5Bridge
+# in demo mode). Real-bar paths never set this; the banner disappears the
+# moment Exness credentials are wired.
 _DEMO_WARNING = (
     "H4 bars are being aliased as H1/M5. FVG break-retest is disabled. "
     "Signals are directional only — verify manually before confirming."
 )
+
+
+# ---------------------------------------------------------------------------
+# In-flight signal guard
+#
+# The scanner fires every ``scan_interval`` seconds inside a kill zone. Without
+# a guard, the same underlying setup (same H4 bar, same direction) would
+# produce an identical signal on every scan — flooding Slack and, worse,
+# accidentally auto-executing duplicates in AUTO mode before the first trade
+# has even filled. We suppress repeats by keying on (instrument, direction,
+# H4 bar timestamp of the current signal). At most one signal per H4 bar
+# per instrument per direction.
+# ---------------------------------------------------------------------------
+_last_signal_key: dict = {}
+
+
+def _signal_key(instrument: str, signal, h4_df) -> tuple:
+    """Build the dedup key for an (instrument, signal, H4 bar) tuple."""
+    try:
+        last_h4 = str(h4_df["datetime"].iloc[-1])
+    except Exception:
+        last_h4 = signal.signal_time  # fallback — still stable within a bar
+    return (instrument, signal.direction, last_h4)
+
+
+def _should_fire(instrument: str, signal, h4_df) -> bool:
+    """Return True if this signal is not a repeat of the last one we fired."""
+    key = _signal_key(instrument, signal, h4_df)
+    if _last_signal_key.get(instrument) == key:
+        return False
+    _last_signal_key[instrument] = key
+    return True
 
 
 def _scan_instrument(
@@ -176,34 +210,76 @@ def _scan_instrument(
 
     from prism.signal.generator import SignalGenerator
     from prism.delivery.confirm_handler import PollConfirmHandler, ConfirmationResult
-
-    # -- Data loading (Phase 4 will pull live bars from MT5) --
-    h4_paths = _resolve_cache_paths(instrument, "4hour")
-    d1_paths = _resolve_cache_paths(instrument, "daily")
-
-    if not h4_paths and not d1_paths:
-        logger.warning("%s: No cached data found -- skipping", instrument)
-        return
-
-    base_df = pd.read_parquet(h4_paths[0] if h4_paths else d1_paths[0])
+    from prism.data.pipeline import PRISMFeaturePipeline
 
     if stats is None:
         stats = {}
 
-    # Phase 4 will replace these with real H1/M5 bars from MT5 bridge.
-    # Until then, H4 data is aliased — FVG break-retest logic disabled.
-    h4_df = base_df
-    h1_df = base_df       # NOTE: aliased to H4 — NOT real H1 data
-    entry_df = base_df    # NOTE: aliased to H4 — NOT real M5 data
-    logger.warning("%s: %s", instrument, _DEMO_WARNING)
+    # -- Data loading --
+    # Live-bar path when the bridge is connected to MT5; cache-backed alias
+    # path when running under MockMT5Bridge. The banner only fires on the
+    # alias path, and we only enable FVG retest on real M5 bars.
+    live = bridge.supports_live_bars()
+    demo_warning: Optional[str] = None
 
-    # persist_fvg=False because entry_df is H4 aliased data, not real M5;
-    # retest validation is meaningless on the alias.
-    gen = SignalGenerator(instrument, persist_fvg=False)
+    if live:
+        h4_raw = bridge.get_bars(instrument, "H4", count=500)
+        h1_raw = bridge.get_bars(instrument, "H1", count=500)
+        entry_raw = bridge.get_bars(instrument, "M5", count=500)
+        if h4_raw is None or h4_raw.empty:
+            logger.warning("%s: No H4 bars from MT5 — skipping", instrument)
+            return
+        # Freshness guard — bail out if the feed is stale on any layer.
+        # Stale bars = old prices = signals fire against data that doesn't
+        # match the current market. Better to skip the scan than silently
+        # trade a ghost.
+        for raw, tf in [(h4_raw, "H4"), (h1_raw, "H1"), (entry_raw, "M5")]:
+            if not bridge.bars_are_fresh(raw, tf, now=now):
+                logger.warning(
+                    "%s: %s bars are stale (latest=%s, now=%s) — skipping scan",
+                    instrument, tf,
+                    raw["datetime"].iloc[-1] if not raw.empty else "∅",
+                    now.isoformat(),
+                )
+                return
+        # Feature-engineer H4 in-memory. H1 and the entry layer are raw
+        # OHLCV — ICC detection and FVG retest don't need features.
+        pipeline = PRISMFeaturePipeline(instrument, timeframe="H4")
+        h4_df = pipeline.build_features_from_bars(h4_raw)
+        h1_df = h1_raw
+        entry_df = entry_raw
+        persist_fvg = True
+    else:
+        # Demo-mode fallback: Mock bridge serves aliased H4 bars for every
+        # timeframe request. Fire the DEMO banner so the notifier surfaces
+        # it, and disable FVG retest because we don't actually have M5.
+        h4_df = bridge.get_bars(instrument, "H4", count=500)
+        if h4_df is None or h4_df.empty:
+            # Legacy cache path for environments where get_bars isn't
+            # implemented on an older bridge — keep the runner bootable.
+            paths = _resolve_cache_paths(instrument, "4hour") or _resolve_cache_paths(instrument, "daily")
+            if not paths:
+                logger.warning("%s: No cached data found -- skipping", instrument)
+                return
+            h4_df = pd.read_parquet(paths[0])
+        h1_df = h4_df
+        entry_df = h4_df
+        persist_fvg = False
+        demo_warning = _DEMO_WARNING
+        logger.warning("%s: %s", instrument, _DEMO_WARNING)
+
+    gen = SignalGenerator(instrument, persist_fvg=persist_fvg)
     signal = gen.generate(h4_df, h1_df, entry_df)
 
     if signal is None:
         logger.info("%s: No signal this scan", instrument)
+        return
+
+    if not _should_fire(instrument, signal, h4_df):
+        logger.info(
+            "%s: Signal %s suppressed — duplicate of last signal on this H4 bar",
+            instrument, signal.direction,
+        )
         return
 
     logger.info(
@@ -214,13 +290,11 @@ def _scan_instrument(
     stats["signals_fired"] = stats.get("signals_fired", 0) + 1
 
     # -- Delivery --
-    # DEMO MODE warning rides on every signal while we're on aliased bars so
-    # Brian sees the banner in Slack, not just the server log.
     ts = notifier.send_signal(
         signal,
         mode=bridge.mode,
         use_buttons=False,
-        demo_warning=_DEMO_WARNING,
+        demo_warning=demo_warning,
     )
     if not ts:
         logger.error("%s: Failed to send signal to Slack", instrument)
@@ -312,6 +386,24 @@ def run() -> None:
 
     from prism.delivery.slack_notifier import SlackNotifier
     from prism.delivery.session_filter import is_kill_zone, session_label
+    from prism.model.predict import missing_model_files
+
+    # Refuse to start if any instrument is missing its trained models.
+    # Without this, SignalGenerator raises FileNotFoundError mid-scan,
+    # the exception gets swallowed by the per-instrument try/except in the
+    # scan loop, and PRISM runs forever in a kill zone producing no signals.
+    # NOTIFY mode is exempt — it's a dry-run with no execution path.
+    if execution_mode != "NOTIFY":
+        missing = missing_model_files(instruments)
+        if missing:
+            logger.error(
+                "Refusing to start in %s mode — missing model artefacts:\n  %s\n"
+                "Run `python -m prism.model.retrain --instrument <SYMBOL>` for each, "
+                "or set PRISM_EXECUTION_MODE=NOTIFY to dry-run.",
+                execution_mode,
+                "\n  ".join(str(p) for p in missing),
+            )
+            raise SystemExit(2)
 
     notifier = SlackNotifier()
     bridge = _build_bridge(execution_mode)
