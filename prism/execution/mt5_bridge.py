@@ -87,6 +87,10 @@ class SignalPacket:
     # SignalGenerator, a retry, a reconciliation replay, or a test fixture —
     # carries a stable audit ID without needing a post-hoc assignment.
     signal_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # Set to True by submit_order() when lot sizing used the retail
+    # approximation (PRISM_ALLOW_APPROX_PIP_VALUE=1). Triggers a
+    # warning block in the Slack signal card.
+    approximate_sizing: bool = False
 
 
 @dataclass
@@ -145,6 +149,11 @@ class MT5Bridge:
         self._next_reconnect_at: Optional[datetime] = None
         self._disconnect_alert_sent: bool = False
         self._reconnect_just_happened: bool = False  # flag cleared after caller reads it
+        # Tracks whether the last calculate_lot_size() call fell back to the
+        # retail pip-value approximation (source="approximation-forced").
+        # submit_order() copies this onto the SignalPacket so the notifier
+        # can surface a warning in the Slack card.
+        self._last_approx: bool = False
         self.reconnect_base_cooldown_sec = (
             reconnect_base_cooldown_sec
             or int(os.environ.get("PRISM_MT5_RECONNECT_BASE_SEC",
@@ -252,19 +261,38 @@ class MT5Bridge:
     # to the demo cache path — stale data + live intent = bad trades.
 
     def _heartbeat_ok(self) -> bool:
-        """Cheapest probe: terminal_info(). Returns False on None / raise."""
+        """
+        Probe the MT5 link. First tries terminal_info().connected (cheap);
+        falls back to account_info() only when terminal_info() is unavailable.
+
+        On some Exness MT5 builds, terminal_info() may raise or return None
+        (method not yet exposed in the installed wheel). In that case we fall
+        back to account_info() which confirms the trading-server connection
+        directly.
+
+        We do NOT fall back when terminal_info().connected is explicitly False
+        — a False response is a definitive disconnect signal and we trust it.
+
+        Returns False on any error or None response.
+        """
         if self._mt5 is None:
             return False
         try:
             info = self._mt5.terminal_info()
             if info is None:
-                return False
-            # MT5 reports "connected" = terminal->broker link. A False
-            # here means the terminal is running but can't reach the
-            # broker — treat as disconnected from PRISM's perspective.
-            return bool(getattr(info, "connected", True))
+                # terminal_info() returned None (method unavailable on this
+                # build) — fall back to account_info() as the liveness probe.
+                try:
+                    return self._mt5.account_info() is not None
+                except Exception:
+                    return False
+            return bool(getattr(info, "connected", False))
         except Exception:
-            return False
+            # terminal_info() raised (missing method, etc.) — fall back.
+            try:
+                return self._mt5.account_info() is not None
+            except Exception:
+                return False
 
     def ensure_connected(self, now: Optional[datetime] = None) -> bool:
         """
@@ -375,6 +403,15 @@ class MT5Bridge:
         val = self._reconnect_just_happened
         self._reconnect_just_happened = False
         return val
+
+    def last_lot_calc_was_approximate(self) -> bool:
+        """Returns True if the last ``calculate_lot_size()`` call used the
+        retail pip-value approximation (source=*approximation-forced*)
+        rather than live MT5 ``symbol_info``. Callers (submit_order) copy
+        this flag onto the SignalPacket so the Slack notifier can surface a
+        warning. Resets to False on every call to ``calculate_lot_size()``.
+        """
+        return self._last_approx
 
     def get_account_balance(self) -> float:
         if not self._connected:
@@ -708,6 +745,7 @@ class MT5Bridge:
 
         risk_amount = account_balance * RISK_PCT
         symbol = self.resolve_symbol(instrument)
+        self._last_approx = False  # reset before each sizing attempt
         pip_value_per_lot, source = self._pip_value_per_lot(symbol, instrument)
 
         if source == "unavailable":
@@ -723,6 +761,7 @@ class MT5Bridge:
             # Explicit opt-in — fall through to the approximation.
             pip_value_per_lot = self._approx_pip_value_per_lot(instrument)
             source = "approximation-forced"
+            self._last_approx = True
 
         if pip_value_per_lot <= 0:
             logger.error(
@@ -805,6 +844,9 @@ class MT5Bridge:
         mt5 = self._mt5
         balance = self.get_account_balance()
         lot = self.calculate_lot_size(signal.instrument, signal.sl, signal.entry, balance)
+        # Propagate approximate-sizing flag to the signal so the Slack notifier
+        # can surface a warning when lot sizing used the retail approximation.
+        signal.approximate_sizing = self._last_approx
         if lot <= 0:
             return ExecutionResult(
                 success=False, ticket=None, error="Invalid lot size",
@@ -898,6 +940,14 @@ class MockMT5Bridge(MT5Bridge):
     """
     Mock bridge for testing without a live MT5 terminal.
     Returns fake ExecutionResult — useful for backtesting signal delivery.
+
+    Contract for callers: All methods that MT5Bridge implements for the
+    reconnect/heartbeat contract (ensure_connected, pop_reconnect_event,
+    should_alert_disconnect, mark_disconnect_alert_sent, disconnected_duration_sec)
+    must be implemented here. MockMT5Bridge always returns the 'connected' happy
+    path — ensure_connected() always True, pop_reconnect_event() always False.
+    Any future mock that overrides these MUST maintain these semantics or risk
+    silently bypassing the reconnect gate in _scan_instrument.
     """
 
     def connect(self, **kwargs) -> bool:

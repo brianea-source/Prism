@@ -154,6 +154,16 @@ class DrawdownGuard:
                 "Drawdown guard: new day %s, SOD balance=$%.2f, threshold=%.1f%%",
                 today, balance, self.max_daily_loss_pct * 100,
             )
+            # Warn when SOD snapshot is taken mid-day (runner started
+            # after midnight). The threshold is relative to this balance,
+            # NOT the real open-of-day balance, which may mislead review.
+            if now.hour > 0 or now.minute > 5:
+                logger.info(
+                    "Drawdown guard: SOD balance snapshot taken at %s UTC "
+                    "(mid-day start). The -%d%% threshold is relative to "
+                    "this balance, not the actual open-of-day balance.",
+                    now.strftime("%H:%M"), int(self.max_daily_loss_pct * 100),
+                )
 
         # Live-bridge deal sync. Mock bridge returns [] so this is a no-op
         # for unit tests unless they monkeypatch deals_since_utc_midnight.

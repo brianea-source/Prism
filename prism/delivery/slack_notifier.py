@@ -141,6 +141,20 @@ class SlackNotifier:
             },
             {"type": "divider"},
         ])
+
+        # Approximate sizing warning — prepended so it leads the card.
+        # Set on the signal by submit_order() when PRISM_ALLOW_APPROX_PIP_VALUE=1
+        # and MT5 symbol_info was unavailable (source="approximation-forced").
+        if getattr(signal, "approximate_sizing", False):
+            blocks.insert(0, {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": (
+                    ":warning: *Approximate lot sizing* — MT5 symbol_info unavailable. "
+                    "Position size may be ~10-20% off. "
+                    "Set PRISM_ALLOW_APPROX_PIP_VALUE=0 to reject instead."
+                )}],
+            })
+
         return blocks
 
     def _format_confirm_blocks(
