@@ -262,16 +262,20 @@ class MT5Bridge:
 
     def _heartbeat_ok(self) -> bool:
         """
-        Probe the MT5 link. First tries terminal_info().connected (cheap);
-        falls back to account_info() only when terminal_info() is unavailable.
+        Probe the MT5 link. First tries terminal_info().connected (cheap),
+        then falls back to account_info() which confirms the trading server
+        connection when terminal_info() is unavailable on this build.
 
-        On some Exness MT5 builds, terminal_info() may raise or return None
-        (method not yet exposed in the installed wheel). In that case we fall
-        back to account_info() which confirms the trading-server connection
-        directly.
+        On some Exness MT5 builds, ``terminal_info()`` returns None (the
+        method is not exposed in the installed wheel). When that happens,
+        ``account_info() is not None`` is more reliable as a definitive
+        liveness check — it confirms the broker-side server is reachable,
+        independent of the terminal's own internet state.
 
-        We do NOT fall back when terminal_info().connected is explicitly False
-        — a False response is a definitive disconnect signal and we trust it.
+        A ``terminal_info().connected = False`` response is treated as a
+        definitive disconnect (not confirmed via account_info) so that the
+        reconnect loop can engage promptly when the terminal reports it is
+        not linked to the broker.
 
         Returns False on any error or None response.
         """
@@ -280,15 +284,17 @@ class MT5Bridge:
         try:
             info = self._mt5.terminal_info()
             if info is None:
-                # terminal_info() returned None (method unavailable on this
-                # build) — fall back to account_info() as the liveness probe.
+                # terminal_info() unavailable on this MT5 build — fall back
+                # to account_info() as the liveness probe.
                 try:
                     return self._mt5.account_info() is not None
                 except Exception:
                     return False
+            # Explicit connected flag — trust it either way.
             return bool(getattr(info, "connected", False))
         except Exception:
-            # terminal_info() raised (missing method, etc.) — fall back.
+            # terminal_info() raised (missing method, import error, etc.).
+            # Fall back to account_info() as it is more broadly supported.
             try:
                 return self._mt5.account_info() is not None
             except Exception:
