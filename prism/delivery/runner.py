@@ -234,6 +234,34 @@ def _scan_instrument(
             )
             return
 
+    # -- MT5 reconnect gate --
+    # Heartbeat + on-failure reinit (exponential backoff). A no-op on Mock.
+    # If the real bridge is currently disconnected AND cooldown says don't
+    # retry yet, SKIP the scan rather than fall through to the demo cache
+    # path — running live-mode strategy against stale parquet bars would
+    # be worse than running nothing.
+    #
+    # getattr() guards against legacy bridge stubs (pre-Phase-4) that
+    # don't implement the reconnect contract. Real MT5Bridge /
+    # MockMT5Bridge both have ensure_connected; a missing method here
+    # means "always connected" which is the correct interpretation for
+    # the legacy stubs.
+    ensure_fn = getattr(bridge, "ensure_connected", None)
+    if ensure_fn is not None and not ensure_fn(now):
+        if getattr(bridge, "should_alert_disconnect", lambda _n: False)(now):
+            dur = getattr(bridge, "disconnected_duration_sec", None) or 0
+            notifier.send_alert(
+                f":warning: *PRISM can't reach MT5* — disconnected for {int(dur)}s. "
+                f"Bot is blind; signals are paused until the link comes back."
+            )
+            bridge.mark_disconnect_alert_sent()
+        logger.warning(
+            "%s: MT5 link down (%ss) — skipping scan",
+            instrument,
+            int(getattr(bridge, "disconnected_duration_sec", None) or 0),
+        )
+        return
+
     # -- Data loading --
     # Live-bar path when the bridge is connected to MT5; cache-backed alias
     # path when running under MockMT5Bridge. The banner only fires on the

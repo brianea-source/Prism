@@ -12,7 +12,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 try:
@@ -107,7 +107,22 @@ class MT5Bridge:
     Handles connection, position sizing, order placement, and trade management.
     """
 
-    def __init__(self, mode: str = "CONFIRM"):
+    # --- Reconnect defaults (overridable via env / constructor) -------------
+    # Heartbeat cadence is set by the runner's scan_interval — the bridge
+    # itself doesn't poll; ensure_connected() is called from the scan loop.
+    _DEFAULT_RECONNECT_BASE_COOLDOWN_SEC = 10
+    _DEFAULT_RECONNECT_MAX_COOLDOWN_SEC = 300     # cap at 5min so bad creds
+                                                  # don't hammer the broker
+    _DEFAULT_DISCONNECT_ALERT_THRESHOLD_SEC = 120 # post Slack alert after 2min
+                                                  # of sustained disconnect
+
+    def __init__(
+        self,
+        mode: str = "CONFIRM",
+        reconnect_base_cooldown_sec: Optional[int] = None,
+        reconnect_max_cooldown_sec: Optional[int] = None,
+        disconnect_alert_threshold_sec: Optional[int] = None,
+    ):
         """
         mode: "CONFIRM" — returns PENDING_APPROVAL result; an external approval
                           surface (e.g. OpenClaw → Slack) must call submit_order()
@@ -120,6 +135,30 @@ class MT5Bridge:
         self._connected = False
         # instrument -> resolved broker symbol name (may differ from instrument)
         self._symbol_cache: dict = {}
+
+        # --- Reconnect state ------------------------------------------------
+        # connect() stashes the kwargs it used so ensure_connected() can
+        # replay them on reinit without re-reading env.
+        self._last_connect_kwargs: dict = {}
+        self._disconnect_at: Optional[datetime] = None
+        self._reconnect_attempts: int = 0
+        self._next_reconnect_at: Optional[datetime] = None
+        self._disconnect_alert_sent: bool = False
+        self.reconnect_base_cooldown_sec = (
+            reconnect_base_cooldown_sec
+            or int(os.environ.get("PRISM_MT5_RECONNECT_BASE_SEC",
+                                  self._DEFAULT_RECONNECT_BASE_COOLDOWN_SEC))
+        )
+        self.reconnect_max_cooldown_sec = (
+            reconnect_max_cooldown_sec
+            or int(os.environ.get("PRISM_MT5_RECONNECT_MAX_SEC",
+                                  self._DEFAULT_RECONNECT_MAX_COOLDOWN_SEC))
+        )
+        self.disconnect_alert_threshold_sec = (
+            disconnect_alert_threshold_sec
+            or int(os.environ.get("PRISM_MT5_DISCONNECT_ALERT_SEC",
+                                  self._DEFAULT_DISCONNECT_ALERT_THRESHOLD_SEC))
+        )
 
     def connect(
         self,
@@ -142,21 +181,12 @@ class MT5Bridge:
             if path:
                 kwargs["path"] = path
 
-            if not mt5.initialize(**kwargs):
-                error = mt5.last_error()
-                logger.error(f"MT5 init failed: {error}")
-                return False
+            # Stash for ensure_connected() reinit — we don't want to
+            # re-read env mid-outage in case the operator rotated creds
+            # after launch (they'd get picked up on the next full restart).
+            self._last_connect_kwargs = dict(kwargs)
 
-            info = mt5.account_info()
-            if info is None:
-                logger.error("MT5 account info unavailable after connect")
-                return False
-
-            logger.info(
-                f"MT5 connected: account={info.login} balance={info.balance} server={info.server}"
-            )
-            self._connected = True
-            return True
+            return self._initialize_mt5(kwargs, initial=True)
 
         except ImportError:
             logger.error("MetaTrader5 package not installed. Run: pip install MetaTrader5")
@@ -165,11 +195,170 @@ class MT5Bridge:
             logger.error(f"MT5 connection error: {e}")
             return False
 
+    def _initialize_mt5(self, kwargs: dict, initial: bool = False) -> bool:
+        """
+        Run mt5.initialize() + account_info() sanity check. Factored out so
+        ensure_connected() can replay it on reconnect without duplicating
+        the error handling.
+
+        Returns True on success. On failure, logs and returns False — caller
+        is responsible for backoff.
+        """
+        if self._mt5 is None:
+            return False
+        try:
+            if not self._mt5.initialize(**kwargs):
+                if initial:
+                    logger.error("MT5 init failed: %s", self._mt5.last_error())
+                return False
+            info = self._mt5.account_info()
+            if info is None:
+                if initial:
+                    logger.error("MT5 account info unavailable after connect")
+                return False
+            if initial:
+                logger.info(
+                    "MT5 connected: account=%s balance=%s server=%s",
+                    info.login, info.balance, info.server,
+                )
+            self._connected = True
+            return True
+        except Exception as e:
+            logger.warning("MT5 init exception: %s", e)
+            return False
+
     def disconnect(self):
         if self._mt5 and self._connected:
             self._mt5.shutdown()
             self._connected = False
             logger.info("MT5 disconnected")
+
+    # ------------------------------------------------------------------
+    # Reconnect / heartbeat (Phase 4)
+    # ------------------------------------------------------------------
+    # Connections drop. Broker maintenance windows, network flaps, laptop
+    # sleep, VPN churn — real deployments disconnect. Without recovery
+    # logic, PRISM goes silent (no errors, just no signals). Worse: if
+    # get_account_balance / deals_since_utc_midnight / symbol_info start
+    # returning None, risk sizing silently falls back to approximations
+    # and the drawdown guard loses its canonical PnL source.
+    #
+    # Contract used by the runner:
+    #   ensure_connected(now) -> bool
+    #     True  => link is alive (either already or just reconnected)
+    #     False => link is down AND cooldown says don't retry yet
+    # When False, the runner SKIPS the scan rather than falling through
+    # to the demo cache path — stale data + live intent = bad trades.
+
+    def _heartbeat_ok(self) -> bool:
+        """Cheapest probe: terminal_info(). Returns False on None / raise."""
+        if self._mt5 is None:
+            return False
+        try:
+            info = self._mt5.terminal_info()
+            if info is None:
+                return False
+            # MT5 reports "connected" = terminal->broker link. A False
+            # here means the terminal is running but can't reach the
+            # broker — treat as disconnected from PRISM's perspective.
+            return bool(getattr(info, "connected", True))
+        except Exception:
+            return False
+
+    def ensure_connected(self, now: Optional[datetime] = None) -> bool:
+        """
+        Verify the MT5 link is alive; attempt one reinit if not. Safe to
+        call every scan (the heartbeat is cheap). On sustained outage,
+        flips ``_connected = False`` so ``supports_live_bars()`` starts
+        reporting False — which in turn prevents the runner from falling
+        through to the demo parquet cache on a live deployment.
+        """
+        now = now or datetime.now(timezone.utc)
+
+        if self._heartbeat_ok():
+            # Transition from disconnected -> connected: clear state +
+            # log recovery time so the audit trail shows the outage.
+            if self._disconnect_at is not None:
+                dur = (now - self._disconnect_at).total_seconds()
+                logger.info(
+                    "MT5 reconnected after %.0fs (%d attempts)",
+                    dur, self._reconnect_attempts,
+                )
+                self._disconnect_at = None
+                self._reconnect_attempts = 0
+                self._next_reconnect_at = None
+                self._disconnect_alert_sent = False
+            self._connected = True
+            return True
+
+        # --- Disconnect detected ---
+        if self._disconnect_at is None:
+            self._disconnect_at = now
+            logger.warning("MT5 heartbeat failed — entering reconnect loop")
+        # Mark disconnected so downstream capability checks (supports_live_bars,
+        # get_bars, deals_since_utc_midnight) report the outage correctly.
+        self._connected = False
+
+        # Cooldown gate — don't hammer the broker.
+        if self._next_reconnect_at is not None and now < self._next_reconnect_at:
+            return False
+
+        self._reconnect_attempts += 1
+        logger.info(
+            "MT5 reconnect attempt %d (cooldown ends %s)",
+            self._reconnect_attempts, self._next_reconnect_at,
+        )
+        # Best-effort shutdown to clear any half-open state before reinit.
+        try:
+            if self._mt5 is not None:
+                self._mt5.shutdown()
+        except Exception:
+            pass
+
+        ok = self._initialize_mt5(self._last_connect_kwargs or {}, initial=False)
+        if ok and self._heartbeat_ok():
+            dur = (now - self._disconnect_at).total_seconds()
+            logger.info(
+                "MT5 reconnected after %.0fs (%d attempts)",
+                dur, self._reconnect_attempts,
+            )
+            self._disconnect_at = None
+            self._reconnect_attempts = 0
+            self._next_reconnect_at = None
+            self._disconnect_alert_sent = False
+            return True
+
+        # Still dead — schedule next attempt with exponential backoff,
+        # capped so bad creds don't keep doubling forever.
+        cooldown = min(
+            self.reconnect_base_cooldown_sec * (2 ** (self._reconnect_attempts - 1)),
+            self.reconnect_max_cooldown_sec,
+        )
+        self._next_reconnect_at = now + timedelta(seconds=cooldown)
+        return False
+
+    @property
+    def disconnected_duration_sec(self) -> Optional[float]:
+        """Seconds since the current outage started, or None if connected."""
+        if self._disconnect_at is None:
+            return None
+        return (datetime.now(timezone.utc) - self._disconnect_at).total_seconds()
+
+    def should_alert_disconnect(self, now: Optional[datetime] = None) -> bool:
+        """
+        True when the outage has lasted long enough to warrant a Slack
+        alert AND we haven't already sent one this outage. One-shot
+        semantics reset on reconnect.
+        """
+        if self._disconnect_alert_sent or self._disconnect_at is None:
+            return False
+        now = now or datetime.now(timezone.utc)
+        dur = (now - self._disconnect_at).total_seconds()
+        return dur >= self.disconnect_alert_threshold_sec
+
+    def mark_disconnect_alert_sent(self) -> None:
+        """Callers invoke this after posting the disconnect alert."""
+        self._disconnect_alert_sent = True
 
     def get_account_balance(self) -> float:
         if not self._connected:
@@ -721,6 +910,17 @@ class MockMT5Bridge(MT5Bridge):
     def deals_since_utc_midnight(self, now=None, magic_number=MAGIC_NUMBER) -> list:
         """Mock bridge has no deal history; realized PnL tracked manually in tests."""
         return []
+
+    def ensure_connected(self, now=None) -> bool:
+        """Mock is always 'connected' — reconnect semantics are a live-bridge concern."""
+        return True
+
+    def should_alert_disconnect(self, now=None) -> bool:
+        return False
+
+    @property
+    def disconnected_duration_sec(self):
+        return None
 
     def get_bars(self, instrument: str, timeframe: str, count: int = 500):
         """
