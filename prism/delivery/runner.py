@@ -478,7 +478,11 @@ def run() -> None:
         )
 
     from prism.delivery.slack_notifier import SlackNotifier
-    from prism.delivery.session_filter import is_kill_zone, session_label
+    from prism.delivery.session_filter import (
+        is_kill_zone,
+        is_sunday_open_gap,
+        session_label,
+    )
     from prism.model.predict import missing_model_files
 
     # Refuse to start if any instrument is missing its trained models.
@@ -539,6 +543,20 @@ def run() -> None:
 
         # Fire daily brief at 22:00 UTC
         _maybe_send_daily_brief(notifier, stats, now)
+
+        # Sunday-open gap guard — the first ~30min after FX re-opens at
+        # 22:00 UTC Sunday have wide spreads, low liquidity, and weekend
+        # gap prints. Skip entirely, regardless of kill-zone state. This
+        # is defense-in-depth: today's kill zones (London/NY) don't
+        # intersect the window, but this protects future Asia-session
+        # expansions and any NOTIFY-mode use that bypasses kill zones.
+        if is_sunday_open_gap(now):
+            logger.info(
+                "Sunday-open gap (%s) — skipping scan, sleeping %ds",
+                now.strftime("%Y-%m-%d %H:%M UTC"), scan_interval,
+            )
+            time.sleep(scan_interval)
+            continue
 
         if not is_kill_zone(now):
             logger.debug("Off kill zone (%s) -- sleeping %ds", session_label(now), scan_interval)
