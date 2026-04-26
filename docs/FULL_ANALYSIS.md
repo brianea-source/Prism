@@ -78,11 +78,16 @@ A comprehensive ICT-derived smart money framework for futures trading.
 - Confirmation: Price must close back inside range after sweep
 
 **Kill Zones (High-Probability Windows):**
-| Kill Zone | Time (EST) | Time (UTC) | Notes |
-|-----------|------------|------------|-------|
-| London | 2:00-5:00 AM | 07:00-10:00 | Major moves, reversals |
-| NY Open | 7:00-10:00 AM | 12:00-15:00 | Highest volume, 9:15-9:30 AM key |
-| Asian | 7:00 PM-2:00 AM | 00:00-07:00 | Low liquidity — AVOID |
+
+GatieTrades's quoted windows (as taught in his livestreams):
+
+| Kill Zone | Time (EST, source) | Notes |
+|-----------|-------------------|-------|
+| London | 2:00-5:00 AM | Major moves, reversals |
+| NY Open | 7:00-10:00 AM | Highest volume, 9:15-9:30 AM key |
+| Asian | 7:00 PM-2:00 AM | Low liquidity — AVOID |
+
+> **Note — PRISM canonical windows differ.** PRISM's `prism/delivery/session_filter.py` uses **London 07:00-11:00 UTC** and **NY 13:00-17:00 UTC** — wider windows than the source's quoted EST hours, picked deliberately during PRD1 to capture both DST and non-DST overlap. The source values above are preserved for methodology fidelity; the PRISM windows are the implementation truth and should not be re-derived from this table.
 
 **Displacement:**
 - Definition: 2+ pip strong impulse candle confirming smart money direction

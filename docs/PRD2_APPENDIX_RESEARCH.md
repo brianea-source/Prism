@@ -66,7 +66,7 @@ Baron operates primarily in options and futures with significant prop firm capit
 
 **Priority: LOW**
 
-**Justification:** Baron's methodology is options-heavy and diverges from PRISM's spot/futures focus. The drawdown-aware sizing is useful but already partially covered by `PRISM_DRAWDOWN_LIMIT_PERCENT`. Strike-level confluence requires an options data feed not currently planned for PRISM.
+**Justification:** Baron's methodology is options-heavy and diverges from PRISM's spot/futures focus. The drawdown-aware sizing is useful but already partially covered by `PRISM_MAX_DAILY_LOSS_PCT` (Phase 4 daily kill-switch, see `prism/delivery/drawdown_guard.py`). Strike-level confluence requires an options data feed not currently planned for PRISM.
 
 ---
 

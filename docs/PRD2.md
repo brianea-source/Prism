@@ -146,7 +146,8 @@ if not allowed:
 #### Data Requirements
 
 - **Source:** Tiingo via `MT5Bridge.get_bars()` (already implemented for H4)
-- **New Fetches:** 1H bars (add to runner scan loop)
+- **H1 Stream:** Already fetched by `runner.py` (`bridge.get_bars(instrument, "H1", count=BAR_COUNT)`) and threaded through to `generator.generate(h4_df, h1_df, entry_df)` for the ICC layer. Phase 5 **reuses** this existing `h1_df` argument — do **not** add a duplicate fetch.
+- **4H Stream:** Already fetched and feature-engineered into `h4_df`. Pass the raw OHLCV (pre-feature-engineering) to the bias engine if EMAs interfere with swing detection; otherwise reuse as-is.
 - **Lookback:** `PRISM_HTF_LOOKBACK_BARS` env var (default: 100)
 
 #### Environment Variables
