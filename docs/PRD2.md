@@ -190,9 +190,9 @@ Add HTF bias to signal block:
 | `test_htf_env_disabled` | PRISM_HTF_ENABLED=0 bypasses gate |
 | `test_htf_lookback_configurable` | PRISM_HTF_LOOKBACK_BARS honored |
 | `test_generator_integration_htf_gate` | generator.py respects HTF gate |
-| ... (25+ tests total) |
+| ... (22-28 tests total) |
 
-**Test Count:** 25+
+**Test Count:** 22-28
 
 ---
 
@@ -208,50 +208,170 @@ Detect and classify smart money concepts: Order Blocks, Liquidity Sweeps, CHOCH/
 ```python
 """
 Order Block Detection — Last opposing candle before displacement.
+
+Phase 6 spec includes the full OB → Mitigated → Rejection Block (RB)
+lifecycle state machine required by @powell.trades methodology
+(see PRD2_APPENDIX_RESEARCH.md §1.5). The detector is NOT complete
+without lifecycle tracking — Phase 6 cannot ship until states transition
+correctly and RB classification works.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 import pandas as pd
+
+class OrderBlockState(str, Enum):
+    """Lifecycle states for an OB. Transitions are one-way except RESPECTED → FRESH."""
+    OB_FRESH = "OB_FRESH"            # Just formed by displacement, never tested
+    OB_TESTED = "OB_TESTED"          # Price returned to zone but did not break it
+    OB_RESPECTED = "OB_RESPECTED"    # Price bounced from zone; ready to be retested
+    OB_MITIGATED = "OB_MITIGATED"    # Price closed through zone — OB is invalidated
+    RB_FRESH = "RB_FRESH"            # OB flipped: price reversed after mitigation
+    RB_TESTED = "RB_TESTED"          # Price returned to test the RB from new direction
+    RB_RESPECTED = "RB_RESPECTED"    # Price bounced from RB; ready to be retested
+    CONSUMED = "CONSUMED"            # Price broke through the RB — terminal state
 
 @dataclass
 class OrderBlock:
     instrument: str
     timeframe: str
-    direction: str       # "BULLISH" or "BEARISH"
+    direction: str       # "BULLISH" or "BEARISH" — original OB direction
     high: float
     low: float
     midpoint: float
     formed_at: str       # ISO datetime
     formed_bar: int
     displacement_size: float  # Pips of displacement that followed
-    mitigated: bool
-    age_bars: int
+    state: OrderBlockState = OrderBlockState.OB_FRESH
+    age_bars: int = 0
+    mitigated_at_bar: Optional[int] = None  # Set when state -> OB_MITIGATED
+    flipped_at_bar: Optional[int] = None    # Set when state -> RB_FRESH
+    test_count: int = 0  # How many times the zone has been touched
+    transition_log: list = field(default_factory=list)  # Audit trail
+
+    @property
+    def is_rejection_block(self) -> bool:
+        """True iff in any RB_* state (RB_FRESH, RB_TESTED, RB_RESPECTED)."""
+        return self.state.value.startswith("RB_")
+
+    @property
+    def is_active(self) -> bool:
+        """True iff not in a terminal/invalid state."""
+        return self.state not in (OrderBlockState.CONSUMED,)
+
+    @property
+    def effective_direction(self) -> str:
+        """
+        Direction that price treats the zone as.
+        - BULLISH OB in OB_* states → still BULLISH (demand zone)
+        - BULLISH OB in RB_* states → flipped to BEARISH (supply zone)
+        """
+        if self.is_rejection_block:
+            return "BEARISH" if self.direction == "BULLISH" else "BULLISH"
+        return self.direction
 
 class OrderBlockDetector:
     def __init__(self, instrument: str, timeframe: str = "H4"):
         self.instrument = instrument
         self.timeframe = timeframe
         self.blocks: list[OrderBlock] = []
-    
+
     def detect(self, df: pd.DataFrame, min_displacement_pips: float = 10.0) -> list[OrderBlock]:
         """
         Scan for Order Blocks:
-        - Bullish OB: Last bearish candle before bullish displacement (2+ pips up)
-        - Bearish OB: Last bullish candle before bearish displacement (2+ pips down)
+        - Bullish OB: Last bearish candle before bullish displacement (≥ min_displacement_pips up)
+        - Bearish OB: Last bullish candle before bearish displacement (≥ min_displacement_pips down)
+        New OBs are appended to self.blocks in OB_FRESH state.
         """
         pass
-    
-    def get_active_blocks(self, max_age_bars: int = 50) -> list[OrderBlock]:
-        """Return unmitigated OBs within age limit."""
+
+    def update_states(self, df: pd.DataFrame) -> None:
+        """
+        Walk all blocks against new bar data, transitioning states per the
+        rules in transition(). Idempotent — call once per scan.
+        """
         pass
-    
+
+    def transition(self, block: OrderBlock, bar: pd.Series, bar_idx: int) -> bool:
+        """
+        Transition a single block based on a single bar. Returns True if
+        state changed.
+
+        Transition rules (one-way unless noted):
+        - OB_FRESH    → OB_TESTED     when bar.high/low touches zone
+        - OB_FRESH    → OB_MITIGATED  when bar.close breaks through zone
+        - OB_TESTED   → OB_RESPECTED  when bar closes back outside zone
+                                       in original direction
+        - OB_TESTED   → OB_MITIGATED  when bar.close breaks zone
+        - OB_RESPECTED → OB_FRESH     reset for next test (only state
+                                       that loops back; capped at 3 cycles)
+        - OB_MITIGATED → RB_FRESH     when bar reverses direction after
+                                       mitigation (close back through zone
+                                       in OPPOSITE direction within 5 bars)
+        - RB_FRESH    → RB_TESTED     when bar returns to zone from new side
+        - RB_FRESH    → CONSUMED      when no return within 20 bars
+        - RB_TESTED   → RB_RESPECTED  when bar closes back outside zone
+                                       in flipped direction
+        - RB_TESTED   → CONSUMED      when bar.close breaks zone (RB invalid)
+        - RB_RESPECTED → RB_FRESH     reset (capped at 3 cycles)
+        Each transition appends (bar_idx, old_state, new_state) to
+        block.transition_log for audit.
+        """
+        pass
+
+    def get_active_blocks(
+        self,
+        max_age_bars: int = 50,
+        states: Optional[list[OrderBlockState]] = None,
+    ) -> list[OrderBlock]:
+        """
+        Return blocks within age limit, optionally filtered by state.
+        states=None returns all non-CONSUMED blocks.
+        """
+        pass
+
     def get_nearest_ob(self, price: float, direction: str) -> Optional[OrderBlock]:
-        """Return the nearest relevant OB for entry (bullish OB for LONG, etc.)."""
+        """
+        Return the nearest relevant active block for entry.
+        Matches by `block.effective_direction` so RBs participate
+        correctly (a bullish-OB-turned-RB matches direction='SHORT').
+        """
         pass
-    
+
     def distance_to_ob(self, price: float, direction: str) -> Optional[float]:
-        """Return distance in pips to nearest OB, or None if no relevant OB."""
+        """Return distance in pips to nearest relevant block, or None."""
         pass
+
+    def htf_priority_filter(
+        self,
+        candidates: list[OrderBlock],
+    ) -> list[OrderBlock]:
+        """
+        Powell's HTF RB priority: 4H/Daily RBs override 1H RBs when both
+        match the same entry. Returns the highest-timeframe block per
+        price level (with 5-pip tolerance).
+        """
+        pass
+```
+
+#### Mermaid: OB/RB Lifecycle (canonical — also referenced from appendix §1.5)
+
+```mermaid
+stateDiagram-v2
+    [*] --> OB_FRESH: detect() finds displacement
+    OB_FRESH --> OB_TESTED: price touches zone
+    OB_FRESH --> OB_MITIGATED: close breaks zone
+    OB_TESTED --> OB_RESPECTED: close back outside (original dir)
+    OB_TESTED --> OB_MITIGATED: close breaks zone
+    OB_RESPECTED --> OB_FRESH: reset (max 3 cycles)
+    OB_MITIGATED --> RB_FRESH: reverse within 5 bars
+    OB_MITIGATED --> CONSUMED: no reverse → terminal
+    RB_FRESH --> RB_TESTED: price returns from new side
+    RB_FRESH --> CONSUMED: no return within 20 bars
+    RB_TESTED --> RB_RESPECTED: close back outside (flipped dir)
+    RB_TESTED --> CONSUMED: close breaks zone (RB invalid)
+    RB_RESPECTED --> RB_FRESH: reset (max 3 cycles)
+    CONSUMED --> [*]
 ```
 
 #### `prism/signal/sweeps.py`
@@ -405,32 +525,58 @@ ob_distance = self.ob_detector.distance_to_ob(current_price, direction_str)
 
 #### Test Files
 
-**`tests/test_order_blocks.py`** (15+ tests)
+**`tests/test_order_blocks.py`** (28-32 tests)
+
+Detection:
 - `test_detect_bullish_ob_after_displacement`
 - `test_detect_bearish_ob_after_displacement`
-- `test_ob_mitigation_tracking`
+- `test_min_displacement_pips_honored`
 - `test_ob_age_filtering`
-- `test_get_nearest_ob_long`
-- `test_get_nearest_ob_short`
-- `test_distance_to_ob_calculation`
-- ... etc.
 
-**`tests/test_sweeps.py`** (10+ tests)
+Lifecycle state machine (NEW — Powell RB methodology, see appendix §1.5):
+- `test_initial_state_is_ob_fresh`
+- `test_transition_fresh_to_tested_on_touch`
+- `test_transition_fresh_to_mitigated_on_close_break`
+- `test_transition_tested_to_respected_on_bounce`
+- `test_transition_tested_to_mitigated_on_break`
+- `test_transition_respected_loops_back_to_fresh`
+- `test_respected_caps_at_3_cycles`
+- `test_transition_mitigated_to_rb_fresh_on_reversal`
+- `test_mitigated_to_consumed_when_no_reversal_in_5_bars`
+- `test_transition_rb_fresh_to_rb_tested_on_return`
+- `test_rb_fresh_to_consumed_when_no_return_in_20_bars`
+- `test_transition_rb_tested_to_rb_respected_on_bounce`
+- `test_rb_tested_to_consumed_when_close_breaks`
+- `test_transition_log_records_all_transitions`
+- `test_idempotent_update_states`
+
+Effective direction + RB classification:
+- `test_is_rejection_block_property`
+- `test_effective_direction_flips_in_rb_states`
+- `test_get_nearest_ob_matches_effective_direction`
+- `test_get_nearest_ob_long_returns_bullish_ob_or_bearish_rb`
+- `test_distance_to_ob_calculation`
+- `test_htf_priority_filter_4h_overrides_1h`
+
+**`tests/test_sweeps.py`** (10-12 tests)
 - `test_detect_high_sweep`
 - `test_detect_low_sweep`
 - `test_sweep_requires_close_inside`
 - `test_has_recent_sweep_long`
 - `test_has_recent_sweep_short`
+- `test_no_sweep_returns_false`
+- `test_sweep_displacement_required`
 - ... etc.
 
-**`tests/test_po3.py`** (5+ tests)
+**`tests/test_po3.py`** (6-8 tests)
 - `test_detect_accumulation_phase`
 - `test_detect_manipulation_phase`
 - `test_detect_distribution_phase`
 - `test_is_entry_phase_requires_both`
 - `test_po3_session_awareness`
+- `test_po3_invalidation_on_failed_manipulation`
 
-**Total Test Count:** 30+
+**Total Test Count:** 44-52 (was 30+; bumped to absorb RB lifecycle from appendix)
 
 ---
 
@@ -640,7 +786,10 @@ If any gate fails, the new feature set stays in the `prism_v2_dev/` branch — d
 | `test_htf_alignment_both_aligned` | BULLISH+BULLISH+LONG → 3 |
 | `test_htf_alignment_misaligned` | BULLISH+BEARISH → 0 |
 | `test_enrich_features_all_columns` | All 7 columns added |
-| ... (15+ tests total) |
+| `test_compute_ote_zone_long_direction` | LONG retracement formula |
+| `test_compute_ote_zone_short_direction` | SHORT retracement formula |
+| `test_compute_ote_zone_invalid_direction` | Returns (False, 0.0) |
+| ... (15-18 tests total) |
 
 ---
 
@@ -920,13 +1069,13 @@ Phase 8 must include an audit pass that updates fixtures to use 2.0 R:R, OR para
 
 | Phase | Tests |
 |-------|-------|
-| 5 (HTF Bias) | 25+ |
-| 6 (Smart Money) | 30+ |
-| 7 (Features) | 15+ |
-| 8 (Quality) | 25+ |
-| **Total PRD2** | **95+** |
-| **PRD1 Baseline** | 360 |
-| **Combined** | **455+** |
+| 5 (HTF Bias) | 22-28 |
+| 6 (Smart Money) | 44-52 (includes RB lifecycle from appendix §1.5) |
+| 7 (Features) | 15-18 |
+| 8 (Quality) | 30-40 (includes PRD1 fixture audit for MIN_RR change) |
+| **Total PRD2** | **111-138** |
+| **PRD1 Baseline** | 360 (verified: `grep -c '^def test_\|^    def test_' tests/`) |
+| **Combined** | **471-498** |
 
 ---
 
@@ -935,10 +1084,12 @@ Phase 8 must include an audit pass that updates fixtures to use 2.0 R:R, OR para
 | Phase | Effort | Depends On |
 |-------|--------|------------|
 | 5 (HTF Bias) | 3-4 days | — |
-| 6 (Smart Money) | 5-7 days | Phase 5 |
-| 7 (Features) | 3-4 days | Phase 6 |
+| 6 (Smart Money) | 7-10 days | Phase 5 |
+| 7 (Features) | 4-5 days | Phase 6 |
 | 8 (Quality) | 3-4 days | Phase 7 |
-| **Total** | **14-19 days** | Sequential |
+| **Total** | **17-23 days** | Sequential |
+
+Phase 6 was 5-7 days in the v2.0 draft; bumped to 7-10 days to absorb the RB lifecycle state machine flagged in `PRD2_APPENDIX_RESEARCH.md §1.5`. Phase 7 was 3-4 days; bumped to 4-5 to cover the historical-state parquet sidecar and the A/B acceptance gate process.
 
 *Assumes single Claude Code agent or equivalent coding capacity.*
 

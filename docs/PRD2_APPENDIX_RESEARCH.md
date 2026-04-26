@@ -258,7 +258,7 @@ stateDiagram-v2
 
 ---
 
-> ⚠️ **PHASE 6 GAP IDENTIFIED:** PRD2.md Phase 6 `OrderBlockDetector` lacks OB mitigation tracking and rejection block classification. @powell.trades methodology requires extending the `OrderBlockDetector` with a mitigation state machine BEFORE Phase 6 can be considered complete. This is a scope addition to PRD2, not post-PRD2 work.
+> ✅ **PHASE 6 GAP RESOLVED IN PRD2.md.** The original PRD2 v2.0 draft's `OrderBlockDetector` lacked OB mitigation tracking and rejection block classification — this would have blocked @powell.trades methodology integration. The canonical lifecycle state machine (FRESH → TESTED → RESPECTED → MITIGATED → RB_FRESH → RB_TESTED → RB_RESPECTED → CONSUMED) is now specified directly in `PRD2.md §Phase 6` with the full `OrderBlock` dataclass, `OrderBlockState` enum, `transition()` rules, and `htf_priority_filter()`. The Mermaid diagram below is preserved here for reference but the implementation truth lives in PRD2.md.
 
 ---
 
