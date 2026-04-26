@@ -117,22 +117,22 @@ class SlackNotifier:
             aligned = htf.get("aligned", False)
             allowed_dir = htf.get("allowed_direction")
 
-            # Build swing sequence strings for 1H and 4H
-            htf_result = getattr(signal, "htf_result", None)
-            swing_seq_1h = ""
-            swing_seq_4h = ""
-
-            if htf_result:
-                swing_points_1h = getattr(htf_result, "swing_points_1h", [])
-                swing_points_4h = getattr(htf_result, "swing_points_4h", [])
-
-                if swing_points_1h and len(swing_points_1h) >= 3:
-                    last_3_1h = [sp["type"] for sp in swing_points_1h[-3:]]
-                    swing_seq_1h = f" ({' → '.join(last_3_1h)})"
-
-                if swing_points_4h and len(swing_points_4h) >= 3:
-                    last_3_4h = [sp["type"] for sp in swing_points_4h[-3:]]
-                    swing_seq_4h = f" ({' → '.join(last_3_4h)})"
+            # Swing sequence enrichment is sourced from the htf_bias dict
+            # itself (populated by SignalGenerator). Falling back to
+            # signal.htf_result is a no-op since SignalPacket does not
+            # carry the full HTFBiasResult object.
+            swing_seq_1h_list = htf.get("swing_seq_1h") or []
+            swing_seq_4h_list = htf.get("swing_seq_4h") or []
+            swing_seq_1h = (
+                f" ({' → '.join(swing_seq_1h_list)})"
+                if len(swing_seq_1h_list) >= 3
+                else ""
+            )
+            swing_seq_4h = (
+                f" ({' → '.join(swing_seq_4h_list)})"
+                if len(swing_seq_4h_list) >= 3
+                else ""
+            )
 
             if aligned and allowed_dir:
                 align_str = f":white_check_mark: {allowed_dir} only"
