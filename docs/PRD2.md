@@ -484,15 +484,29 @@ def compute_ote_zone(
     current_price: float,
     swing_high: float,
     swing_low: float,
+    direction: str,
 ) -> tuple[bool, float]:
     """
     Check if price is in OTE zone (61.8% - 78.6% fib retracement).
     Returns (in_ote, fib_level).
+
+    For LONG (retracement off swing_high toward swing_low):
+        retracement = (swing_high - current_price) / range_size
+    For SHORT (retracement off swing_low toward swing_high):
+        retracement = (current_price - swing_low) / range_size
+
+    Phase 8's check_ote_zone() takes the same `direction` argument —
+    keep these signatures aligned to avoid drift.
     """
     range_size = swing_high - swing_low
     if range_size <= 0:
         return False, 0.0
-    retracement = (swing_high - current_price) / range_size  # For bullish
+    if direction == "LONG":
+        retracement = (swing_high - current_price) / range_size
+    elif direction == "SHORT":
+        retracement = (current_price - swing_low) / range_size
+    else:
+        return False, 0.0
     in_ote = 0.618 <= retracement <= 0.786
     return in_ote, retracement
 
@@ -595,10 +609,22 @@ ict_eng = ICTFeatureEngineer(self.instrument)
 
 #### Retraining Process
 
-1. Run `python -m prism.model.retrain --instrument XAUUSD` with new features
-2. Compare test-set accuracy: old features vs. new features
-3. Log feature importance rankings
-4. A/B test in NOTIFY mode for 2 weeks before enabling AUTO
+1. Run `python prism/model/retrain.py --instrument XAUUSD` with new features (existing argparse CLI, see `retrain.py:32`)
+2. Cache historical detector state — Phase 6 detectors (OB, sweep, Po3) need bar-by-bar state to feed Phase 7's enrichment for offline retraining. Add a `prism/data/historical_state.py` builder that walks the training set once and writes detector outputs to a parquet sidecar; `_engineer_features()` reads from the sidecar instead of recomputing per-bar at training time.
+3. Compare test-set metrics: old features vs. new features
+4. Log feature importance rankings (SHAP, top-20)
+
+#### Acceptance Criteria (gates promotion of new feature set)
+
+| Metric | Gate | Rationale |
+|--------|------|-----------|
+| Test-set F1 | new ≥ baseline | If F1 regresses, new features are net noise |
+| Sharpe (walk-forward) | new ≥ baseline × 0.95 | Allow 5% slack for variance |
+| Max drawdown | new ≤ baseline × 1.10 | Don't trade Sharpe for blow-up risk |
+| Top-20 feature stability | ≥ 60% overlap with baseline | Sanity check — wholesale feature churn = data leakage suspect |
+| A/B in NOTIFY mode | 2 weeks live, ≥ 30 signals fired | Live distribution must match backtest |
+
+If any gate fails, the new feature set stays in the `prism_v2_dev/` branch — do NOT merge to main. Document the failure mode in `docs/PHASE_7_AB_RESULTS.md` for the next iteration.
 
 #### Test File: `tests/test_feature_engineering.py`
 
@@ -677,13 +703,21 @@ def check_candle_confirmation(
     df: pd.DataFrame,
     direction: str,
     lookback: int = 3,
+    at_structure: bool = False,
 ) -> bool:
     """
-    Check for reversal candle pattern:
-    - Engulfing
-    - Hammer / Inverted Hammer
-    - Doji
-    - Morning Star / Evening Star
+    Check for reversal candle pattern. Accepted patterns:
+    - Engulfing (always counts when in correct direction)
+    - Hammer / Inverted Hammer (always counts at zone)
+    - Morning Star / Evening Star (always counts)
+    - Doji — counts ONLY when at_structure=True
+
+    `at_structure` should be set by the caller when the candle is forming
+    at an Order Block boundary, FVG edge, or HTF swing point. A doji in
+    the middle of a range is indecision, not reversal — admitting it
+    standalone would dilute this gate. This matches finastictrading's
+    "two confirmations" rule (reversal candle + 8 EMA close), where the
+    candle pattern alone never enters; structure context is required.
     """
     pass
 
@@ -822,9 +856,19 @@ if not quality.passed:
 | `test_quality_filter_all_pass` | All checks pass → QualityCheckResult.passed=True |
 | `test_quality_filter_partial_fail` | One check fails → passed=False with reasons |
 | `test_quality_filter_env_overrides` | Env vars honored |
-| ... (25+ tests total) |
+| ... (25-30 tests total) |
 
-**Total Test Count:** 25+
+**Existing Test Audit (required when MIN_RR raises 1.5 → 2.0):**
+
+The MIN_RR change is described as "trivial, one number" but several PRD1 tests assert against the 1.5 threshold via fixture R:R values:
+
+- `tests/test_phase2.py` — fixture signals around 1.5 R:R
+- `tests/test_phase3.py` / `test_phase3_polish.py` — Slack notification fixtures
+- `tests/test_phase3_hotfix.py` — confirm-flow fixtures
+
+Phase 8 must include an audit pass that updates fixtures to use 2.0 R:R, OR parametrizes fixtures to read `PRISM_MIN_RR` from env. Budget: ~5-10 fixture updates beyond the 25-30 new quality-filter tests. Total Phase 8 delta: 30-40 tests.
+
+**Total Test Count:** 30-40 (25-30 new + 5-10 fixture updates)
 
 ---
 
