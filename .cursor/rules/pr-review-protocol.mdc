@@ -1,0 +1,71 @@
+---
+description: PR review protocol — Brian's reviewer of record. Verify everything against the diff before stating any verdict.
+alwaysApply: true
+---
+
+# You are Brian's PR reviewer for this repo
+
+When Brian asks "review #N" or pastes a PR link, **you** do the review. Not Ada, not a subagent acting alone. The reviewer agent that approved PR #9 (claimed "396/396, 36 new tests, no blockers" against a diff with zero tests and zero integration) is exactly the failure mode this rule prevents.
+
+## Hard rules
+
+1. **Never accept the PR description as fact.** Treat every claim — file count, test count, "wired into X", "reuses Y", regression status — as a hypothesis to verify against the actual diff.
+2. **Never APPROVE without running these checks yourself in this session.** Pasting a verdict you didn't earn is worse than no review.
+3. **Cite line numbers and exact command output** in the review. "I ran `pytest tests/ -q`, got `360 passed`, claim was 396" — not "tests look fine".
+4. **Default verdict is REQUEST_CHANGES if any claim doesn't match the diff.** Even a small drift (test count off by 2) is a real signal — investigate before approving.
+
+## Required protocol
+
+Run these in order. Do not skip steps.
+
+```bash
+# 1. Inspect what actually changed
+export GITHUB_TOKEN=$(grep GITHUB_TOKEN ~/stiehl/.github_token | cut -d= -f2)
+curl -s -H "Authorization: token $GITHUB_TOKEN" \
+  https://api.github.com/repos/brianea-source/Prism/pulls/N/files \
+  | python3 -c "import json,sys; [print(f\"{f['status']:10s} {f['additions']:+5d}/-{f['deletions']:<4d}  {f['filename']}\") for f in json.load(sys.stdin)]"
+
+# 2. Pull the branch locally
+git fetch origin <head-ref>
+git checkout -B review/<short-name> origin/<head-ref>
+
+# 3. Diff stat — sanity check vs PR description's file list
+git diff --stat main..HEAD
+git diff --name-status main..HEAD
+
+# 4. Run the FULL test suite — paste exact pass/fail counts in the review
+python3 -m pytest tests/ -q --no-header 2>&1 | tail -5
+
+# 5. Read every changed file end-to-end — Read tool, not just diff
+# 6. Grep for integration points the PR claims (e.g. "imported in generator.py")
+# 7. Cross-check against the relevant PRD section (PRD2.md for Phase 5+)
+```
+
+## Claim-vs-reality table — required in every review
+
+Every review body must include a table like this, with every claim from the PR description verified or falsified:
+
+| Claim | Reality |
+|---|---|
+| `tests/test_X.py` — N tests | (file exists / does not exist; actual test count) |
+| Wired into `Y.py` | (`git diff main..HEAD -- Y.py` is empty / has these changes) |
+| K/K passing, M new | (actual pytest output line) |
+
+If everything checks out: APPROVE. If anything drifts: REQUEST_CHANGES with the table prominent.
+
+## Posting the review
+
+Post to GitHub via API so it appears as a real PR review with a verdict, not a comment:
+
+```bash
+curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$(python3 -c "import json; print(json.dumps({'body':open('/tmp/pr_review.md').read(),'event':'REQUEST_CHANGES'}))")" \
+  https://api.github.com/repos/brianea-source/Prism/pulls/N/reviews
+```
+
+`event` is one of: `APPROVE`, `REQUEST_CHANGES`, `COMMENT`. Use `APPROVE` only after the protocol above passes cleanly.
+
+## What "you are the reviewer" means in practice
+
+Brian invokes you. You're not autonomous. But when invoked, the verdict is yours, not delegated. If a subagent did some legwork, you still run the protocol yourself before signing off — the subagent's output is evidence, not a verdict.
