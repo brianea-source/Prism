@@ -445,7 +445,8 @@ class TestRunnerWiring:
 
         assert _SignalGenSpy.invoked is False, \
             "Tripped guard must short-circuit before SignalGenerator is constructed"
-        assert guard.refresh_calls == 1
+        # guard.refresh() is now called once per cycle in run(), not inside _scan_instrument
+        # (Fix #6: avoids N*history_deals_get MT5 calls per cycle)
         assert len(notifier.alerts) == 1
         assert "halted" in notifier.alerts[0].lower()
 

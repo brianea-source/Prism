@@ -38,6 +38,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _shutdown = False
 
+# ---------------------------------------------------------------------------
+# Bar history depth — configurable so replay / back-test runs can override
+# without touching code. 500 is the production default: enough for 200-period
+# EMAs and the ATR rolling window used throughout the signal stack.
+# ---------------------------------------------------------------------------
+BAR_COUNT = int(os.environ.get("PRISM_BAR_COUNT", "500"))
+
 
 def _handle_sigterm(signum, frame):
     """Set the shutdown flag so the main loop exits cleanly."""
@@ -256,12 +263,13 @@ def _scan_instrument(
         stats = {}
 
     # -- Drawdown guard gate --
-    # Refresh first (may reset into a new UTC day, may sync MT5 deals).
+    # guard.refresh(now) is called once per scan cycle in run() — before
+    # the per-instrument loop — to avoid N×history_deals_get MT5 calls per
+    # cycle. Here we only check the gate state (already refreshed).
     # If tripped, send a one-shot Slack alert and skip signal generation.
     # We deliberately check this BEFORE any bar fetching so a halted PRISM
     # doesn't hammer the data provider for work it will ignore.
     if guard is not None:
-        guard.refresh(now)
         if guard.is_tripped:
             if guard.needs_notification:
                 ts = notifier.send_alert(guard.format_alert())
@@ -316,9 +324,9 @@ def _scan_instrument(
     demo_warning: Optional[str] = None
 
     if live:
-        h4_raw = bridge.get_bars(instrument, "H4", count=500)
-        h1_raw = bridge.get_bars(instrument, "H1", count=500)
-        entry_raw = bridge.get_bars(instrument, "M5", count=500)
+        h4_raw = bridge.get_bars(instrument, "H4", count=BAR_COUNT)
+        h1_raw = bridge.get_bars(instrument, "H1", count=BAR_COUNT)
+        entry_raw = bridge.get_bars(instrument, "M5", count=BAR_COUNT)
         if h4_raw is None or h4_raw.empty:
             logger.warning("%s: No H4 bars from MT5 — skipping", instrument)
             return
@@ -346,7 +354,7 @@ def _scan_instrument(
         # Demo-mode fallback: Mock bridge serves aliased H4 bars for every
         # timeframe request. Fire the DEMO banner so the notifier surfaces
         # it, and disable FVG retest because we don't actually have M5.
-        h4_df = bridge.get_bars(instrument, "H4", count=500)
+        h4_df = bridge.get_bars(instrument, "H4", count=BAR_COUNT)
         if h4_df is None or h4_df.empty:
             # Legacy cache path for environments where get_bars isn't
             # implemented on an older bridge — keep the runner bootable.
@@ -361,8 +369,17 @@ def _scan_instrument(
         demo_warning = _DEMO_WARNING
         logger.warning("%s: %s", instrument, _DEMO_WARNING)
 
-    gen = SignalGenerator(instrument, persist_fvg=persist_fvg)
-    signal = gen.generate(h4_df, h1_df, entry_df)
+    try:
+        gen = SignalGenerator(instrument, persist_fvg=persist_fvg)
+        signal = gen.generate(h4_df, h1_df, entry_df)
+    except FileNotFoundError as exc:
+        logger.error("%s: Model file missing mid-run: %s", instrument, exc)
+        notifier.send_alert(
+            f":warning: *PRISM model file missing* — `{instrument}` signals paused.\n"
+            f"Missing: `{exc.filename or exc}`\n"
+            f"Run `python -m prism.model.retrain --instrument {instrument}` to fix."
+        )
+        return
 
     if signal is None:
         logger.info("%s: No signal this scan", instrument)
@@ -564,6 +581,13 @@ def run() -> None:
             continue
 
         logger.info("Kill zone active: %s -- scanning %s", session_label(now), instruments)
+
+        # Refresh guard once per scan cycle (not once per instrument).
+        # guard.refresh() calls history_deals_get on MT5 — one call covers
+        # all instruments, so doing it inside _scan_instrument would fire
+        # it N×per cycle (one per instrument).
+        if guard is not None:
+            guard.refresh(now)
 
         for instrument in instruments:
             if _shutdown:

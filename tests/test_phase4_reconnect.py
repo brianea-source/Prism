@@ -63,6 +63,11 @@ class _FakeMT5:
         return _FakeTerminalInfo(connected=self._terminal_alive)
 
     def account_info(self):
+        # When terminal_info() returns None or would raise, the real MT5
+        # terminal is also unreachable for account_info(). Model that here
+        # so fallback tests work correctly.
+        if self._terminal_alive is None or self._terminal_alive is False:
+            return None
         return self._account_info
 
     def last_error(self):
@@ -106,6 +111,8 @@ class TestHeartbeat:
         b, fake = _connected_bridge()
         def _boom(*a, **kw): raise RuntimeError("segfault")
         fake.terminal_info = _boom
+        # When terminal_info raises, account_info also fails (terminal is dead)
+        fake.account_info = _boom
         assert b._heartbeat_ok() is False
 
     def test_dead_when_mt5_module_none(self):

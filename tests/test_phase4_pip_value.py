@@ -375,3 +375,37 @@ class TestAuditLogging:
         )
         assert any("source=approximation" in r.message for r in caplog.records), \
             "Mock bridge must declare source=approximation for audit"
+
+
+# ===========================================================================
+# Fix 5 — GBPUSD/EURUSD approx fallback contract (explicit coverage)
+# ===========================================================================
+
+class TestApproxFallback:
+    """Lock in the APPROX_PIP_VALUE_PER_LOT dispatch contract for MockMT5Bridge.
+
+    GBPUSD has no explicit key in APPROX_PIP_VALUE_PER_LOT — it falls through
+    to ``__DEFAULT__ = 10.0``. This test makes that contract explicit so any
+    future change to the dispatch logic is immediately visible.
+    """
+
+    def test_eurusd_uses_default(self):
+        b = MockMT5Bridge()
+        b.connect()
+        val, source = b._pip_value_per_lot("EURUSD", "EURUSD")
+        assert source == "approximation"
+        assert val == APPROX_PIP_VALUE_PER_LOT["__DEFAULT__"]
+
+    def test_gbpusd_uses_default(self):
+        b = MockMT5Bridge()
+        b.connect()
+        val, source = b._pip_value_per_lot("GBPUSD", "GBPUSD")
+        assert source == "approximation"
+        assert val == APPROX_PIP_VALUE_PER_LOT["__DEFAULT__"]
+
+    def test_xauusd_uses_gold_approx(self):
+        b = MockMT5Bridge()
+        b.connect()
+        val, source = b._pip_value_per_lot("XAUUSD", "XAUUSD")
+        assert source == "approximation"
+        assert val == APPROX_PIP_VALUE_PER_LOT["XAUUSD"]
