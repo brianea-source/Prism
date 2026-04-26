@@ -109,11 +109,49 @@ class SlackNotifier:
         if fvg_str:
             body_lines.append(f":package: *FVG Zone:*        {fvg_str}")
 
+        # HTF Bias section (Phase 5)
+        htf = getattr(signal, "htf_bias", None) or {}
+        if htf:
+            bias_1h = htf.get("bias_1h", "N/A")
+            bias_4h = htf.get("bias_4h", "N/A")
+            aligned = htf.get("aligned", False)
+            allowed_dir = htf.get("allowed_direction")
+
+            # Build swing sequence strings for 1H and 4H
+            htf_result = getattr(signal, "htf_result", None)
+            swing_seq_1h = ""
+            swing_seq_4h = ""
+
+            if htf_result:
+                swing_points_1h = getattr(htf_result, "swing_points_1h", [])
+                swing_points_4h = getattr(htf_result, "swing_points_4h", [])
+
+                if swing_points_1h and len(swing_points_1h) >= 3:
+                    last_3_1h = [sp["type"] for sp in swing_points_1h[-3:]]
+                    swing_seq_1h = f" ({' → '.join(last_3_1h)})"
+
+                if swing_points_4h and len(swing_points_4h) >= 3:
+                    last_3_4h = [sp["type"] for sp in swing_points_4h[-3:]]
+                    swing_seq_4h = f" ({' → '.join(last_3_4h)})"
+
+            if aligned and allowed_dir:
+                align_str = f":white_check_mark: {allowed_dir} only"
+            else:
+                align_str = ":x: RANGING/misaligned"
+            body_lines += [
+                "",
+                ":chart_with_upwards_trend: *HTF Bias*",
+                f"  1H: {bias_1h}{swing_seq_1h}",
+                f"  4H: {bias_4h}{swing_seq_4h}",
+                f"  Alignment: {align_str}",
+            ]
+
         # Show a short, human-scannable signal_id so Slack audit ↔ MT5 comment
         # ↔ server logs reconcile without copy-pasting a full UUID.
         short_id = (getattr(signal, "signal_id", "") or "")[:8] or "n/a"
 
         body_lines += [
+            "",
             f"{regime_emoji} *Regime:*          {signal.regime} - News: {signal.news_bias}",
             f":clock1: *Session:*         {session_str}",
             "",
