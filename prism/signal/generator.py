@@ -173,6 +173,11 @@ class SignalGenerator:
                 "bias_4h": htf_result.bias_4h.value,
                 "aligned": htf_result.aligned,
                 "allowed_direction": htf_result.allowed_direction,
+                # Last 3 swing types per timeframe — drives the Slack
+                # "(HH → HL → HH)" enrichment without leaking the full
+                # HTFBiasResult object through the SignalPacket dataclass.
+                "swing_seq_1h": [sp["type"] for sp in htf_result.swing_points_1h[-3:]],
+                "swing_seq_4h": [sp["type"] for sp in htf_result.swing_points_4h[-3:]],
             },
         )
         return packet
