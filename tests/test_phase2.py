@@ -670,6 +670,14 @@ def test_signal_generator_end_to_end_returns_packet(tmp_path, monkeypatch):
     ))
     gen.news.should_block_trade = MagicMock(return_value=(False, ""))
 
+    # HTF Bias: allow LONG (Phase 5)
+    from prism.signal.htf_bias import Bias
+    gen.htf_engine.refresh = MagicMock(return_value=MagicMock(
+        bias_1h=Bias.BULLISH, bias_4h=Bias.BULLISH,
+        aligned=True, allowed_direction="LONG"
+    ))
+    gen.htf_engine.gate_signal = MagicMock(return_value=(True, "HTF aligned"))
+
     # Layer 1: predictor says LONG high-conf
     mock_predictor = MagicMock()
     mock_predictor.predict_latest.return_value = {

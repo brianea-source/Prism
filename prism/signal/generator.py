@@ -20,6 +20,7 @@ import pandas as pd
 
 from prism.signal.fvg import FVGDetector, FVGZone
 from prism.signal.icc import ICCDetector
+from prism.signal.htf_bias import HTFBiasEngine
 from prism.news.intelligence import NewsIntelligence, NewsSignal
 from prism.execution.mt5_bridge import SignalPacket
 
@@ -40,6 +41,7 @@ class SignalGenerator:
         self.news = NewsIntelligence()
         self.icc = ICCDetector()
         self.fvg = FVGDetector(instrument, "H4")
+        self.htf_engine = HTFBiasEngine()
         self._predictor = None
 
     def _load_predictor(self):
@@ -95,6 +97,13 @@ class SignalGenerator:
                     f"({news_signal.news_bias}) — skipping"
                 )
                 return None
+
+        # --- HTF Bias Gate (Phase 5) ---
+        htf_result = self.htf_engine.refresh(h1_df, h4_df)
+        allowed, htf_reason = self.htf_engine.gate_signal(direction_str)
+        if not allowed:
+            logger.info(f"HTF gate blocked: {htf_reason}")
+            return None
 
         # --- Layer 2: ICC Structure (H1) ---
         icc_signals = self.icc.detect_signals(h1_df)
@@ -159,6 +168,12 @@ class SignalGenerator:
             news_bias=news_signal.news_bias,
             fvg_zone=vars(fvg_zone),
             signal_time=datetime.now(timezone.utc).isoformat(),
+            htf_bias={
+                "bias_1h": htf_result.bias_1h.value,
+                "bias_4h": htf_result.bias_4h.value,
+                "aligned": htf_result.aligned,
+                "allowed_direction": htf_result.allowed_direction,
+            },
         )
         return packet
 

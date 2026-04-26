@@ -91,6 +91,8 @@ class SignalPacket:
     # approximation (PRISM_ALLOW_APPROX_PIP_VALUE=1). Triggers a
     # warning block in the Slack signal card.
     approximate_sizing: bool = False
+    # HTF bias info (Phase 5) - dict with bias_1h, bias_4h, aligned, allowed_direction
+    htf_bias: Optional[dict] = None
 
 
 @dataclass
