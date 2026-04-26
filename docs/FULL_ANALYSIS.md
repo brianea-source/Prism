@@ -122,7 +122,7 @@ Curated learning path from multiple educators:
 
 | Creator | Focus | Key Teaching |
 |---------|-------|--------------|
-| Bitcoin Playboy | Full course | $139K+ profit at 99.7% return — complete methodology |
+| Bitcoin Playboy | Full course | $139K+ profit at 99.7% return — complete methodology *(source claim, unverified)* |
 | TTrades | HTF→LTF | Top-down analysis framework |
 | The Traveling Trader | Psychology | Mental game, 5 years of failure before breakthrough |
 | JeaFx (861K views) | Candle patterns | Indecision → Reversal → Strength candle → BUY |

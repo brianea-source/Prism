@@ -152,7 +152,7 @@ Expected outcome: Win rate improves from ~55% to ~70-75% by filtering low-qualit
    - I'll analyze anything else you want to throw at this
 
 2. REVIEW PRD2
-   - Full PRD2 is in /Users/ada/.openclaw/workspace/prism_research/PRD2.md
+   - Full PRD2 is in [docs/PRD2.md](./PRD2.md) (committed to repo)
    - It has exact file names, function signatures, env vars, and test counts
    - Let me know if any phase needs adjustment before I start coding
 

@@ -49,7 +49,7 @@ Full 4-part system:
 ---
 
 ### Source B: @samsidney_ — 8-Step Trading Education Playlist
-1. Bitcoin Playboy: Full trading course — $139K+ profit at 99.7% return
+1. Bitcoin Playboy: Full trading course — $139K+ profit at 99.7% return *(source claim, unverified)*
 2. TTrades: Top-down HTF→LTF analysis framework
 3. The Traveling Trader: Trading psychology — mental game, 5 years failure before breakthrough
 4. JeaFx (861K views): Indecision → Reversal → Strength candle → BUY entry
