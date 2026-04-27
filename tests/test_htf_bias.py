@@ -186,6 +186,18 @@ class TestDetectSwingStructure:
             bar_idxs = [s["bar_idx"] for s in swings]
             assert bar_idxs == sorted(bar_idxs)
 
+    def test_detect_swing_structure_nan_returns_empty(self, caplog):
+        """NaN in high or low should log a warning and return []."""
+        import logging
+        df = make_swing_df_with_clear_pattern("uptrend")
+        df.loc[10, "high"] = float("nan")
+
+        with caplog.at_level(logging.WARNING, logger="prism.signal.htf_bias"):
+            swings = detect_swing_structure(df, lookback=3)
+
+        assert swings == []
+        assert any("NaN" in record.message for record in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Test: classify_bias
@@ -485,11 +497,17 @@ class TestHTFBiasEngine:
             assert mock_get.call_count == 2
 
     def test_htf_engine_raises_if_no_refresh(self):
-        """gate_signal should raise ValueError if refresh() never called."""
-        engine = HTFBiasEngine()
+        """gate_signal should raise ValueError if refresh() never called.
 
-        with pytest.raises(ValueError) as exc_info:
-            engine.gate_signal("LONG")
+        Pin PRISM_HTF_ENABLED=1 so this test does not depend on whatever
+        env state earlier tests may have leaked. The disabled-gate path
+        is covered separately by test_htf_engine_gate_disabled.
+        """
+        with patch.dict(os.environ, {"PRISM_HTF_ENABLED": "1"}):
+            engine = HTFBiasEngine()
+
+            with pytest.raises(ValueError) as exc_info:
+                engine.gate_signal("LONG")
 
         assert "refresh" in str(exc_info.value).lower()
 

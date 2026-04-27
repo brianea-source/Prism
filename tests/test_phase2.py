@@ -670,11 +670,23 @@ def test_signal_generator_end_to_end_returns_packet(tmp_path, monkeypatch):
     ))
     gen.news.should_block_trade = MagicMock(return_value=(False, ""))
 
-    # HTF Bias: allow LONG (Phase 5)
+    # HTF Bias: allow LONG (Phase 5).
+    # swing_points_* are required by generator.py to build the
+    # swing_seq_1h / swing_seq_4h Slack enrichment fields (Phase 5.1).
     from prism.signal.htf_bias import Bias
     gen.htf_engine.refresh = MagicMock(return_value=MagicMock(
         bias_1h=Bias.BULLISH, bias_4h=Bias.BULLISH,
-        aligned=True, allowed_direction="LONG"
+        aligned=True, allowed_direction="LONG",
+        swing_points_1h=[
+            {"type": "HH", "price": 1.10, "bar_idx": 5},
+            {"type": "HL", "price": 1.09, "bar_idx": 10},
+            {"type": "HH", "price": 1.11, "bar_idx": 15},
+        ],
+        swing_points_4h=[
+            {"type": "HH", "price": 1.10, "bar_idx": 3},
+            {"type": "HL", "price": 1.09, "bar_idx": 6},
+            {"type": "HH", "price": 1.12, "bar_idx": 9},
+        ],
     ))
     gen.htf_engine.gate_signal = MagicMock(return_value=(True, "HTF aligned"))
 
@@ -724,6 +736,14 @@ def test_signal_generator_end_to_end_returns_packet(tmp_path, monkeypatch):
     assert packet.fvg_zone is not None
     # Persistence side effect: per-instrument FVG store was written
     assert (tmp_path / "fvg_zones_EURUSD_H4.json").exists()
+    # Phase 5.1: swing sequences propagate from HTFBiasResult into the
+    # htf_bias dict so the Slack notifier can render "(HH → HL → HH)"
+    # without needing access to the full HTFBiasResult object.
+    assert packet.htf_bias is not None
+    assert packet.htf_bias["swing_seq_1h"] == ["HH", "HL", "HH"]
+    assert packet.htf_bias["swing_seq_4h"] == ["HH", "HL", "HH"]
+    assert packet.htf_bias["bias_1h"] == "BULLISH"
+    assert packet.htf_bias["aligned"] is True
 
 
 def test_signal_generator_skips_when_icc_disagrees_with_ml():
