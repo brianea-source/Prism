@@ -399,6 +399,17 @@ def _scan_instrument(
     )
     stats["signals_fired"] = stats.get("signals_fired", 0) + 1
 
+    # Phase 6.F: structured per-signal audit. Wired after _should_fire so
+    # the live audit log records exactly the "signal-producing bars"
+    # population that PHASE_7A_SCOPE.md §6.1 commits to for gate-5 drift
+    # comparison. ``when=now`` pins the audit timestamp to the scan time
+    # (not the wall-clock when the audit code happens to execute), which
+    # matters for replay / back-test runs where the two diverge. The
+    # audit writer never raises — a broken audit log must not abort
+    # delivery to Slack / MT5.
+    from prism.delivery.signal_audit import write_signal_audit
+    write_signal_audit(signal, when=now)
+
     # -- Delivery --
     ts = notifier.send_signal(
         signal,
