@@ -34,6 +34,7 @@ These are the synthesis artifacts that fed PRD2. Read in this order if you want 
 | Doc | Scope |
 |-----|-------|
 | [RUNBOOK.md](./RUNBOOK.md) | Operator playbook — host setup, retraining, pre-live health check, runner start, observability, recovery, demo→live promotion |
+| [PHASE_6_ROLLOUT.md](./PHASE_6_ROLLOUT.md) | Three-stage rollout for the smart-money confluence layer (`PRISM_SMART_MONEY_ENABLED` + sub-gates). Pre-flight, stage advancement criteria, rollback ladder. |
 
 ---
 
