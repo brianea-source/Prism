@@ -176,6 +176,10 @@ class OrderBlockDetector:
 
         elif block.state == OrderBlockState.OB_RESPECTED:
             # Rules 5/6: OB_RESPECTED → OB_FRESH (reset) or CONSUMED (max resets)
+            # Design note: reset fires unconditionally on the next bar entering this
+            # state — no price check needed because OB_RESPECTED already required a
+            # confirmed bounce. Each reset cycle allows the zone to absorb one more
+            # test; after 3 cycles the zone is considered structurally consumed.
             if block.reset_cycles >= 3:
                 # Rule 6: Too many resets, consume
                 new_state = OrderBlockState.CONSUMED
@@ -186,17 +190,17 @@ class OrderBlockDetector:
 
         elif block.state == OrderBlockState.OB_MITIGATED:
             # Rule 8: OB_MITIGATED → CONSUMED (timeout - no reversal within 5 bars)
-            if block.mitigated_at_bar is not None and block.age_bars - block.mitigated_at_bar > 5:
+            if block.mitigated_at_bar is not None and bar_idx - block.mitigated_at_bar > 5:
                 new_state = OrderBlockState.CONSUMED
             # Rule 7: OB_MITIGATED → RB_FRESH (reversal within 5 bars)
-            elif block.mitigated_at_bar is not None and block.age_bars - block.mitigated_at_bar <= 5:
+            elif block.mitigated_at_bar is not None and bar_idx - block.mitigated_at_bar <= 5:
                 if self._reversal_after_mitigation(block, bar):
                     new_state = OrderBlockState.RB_FRESH
                     block.flipped_at_bar = bar_idx
 
         elif block.state == OrderBlockState.RB_FRESH:
             # Rule 10: RB_FRESH → CONSUMED (timeout - no return within 20 bars)
-            if block.flipped_at_bar is not None and block.age_bars - block.flipped_at_bar > 20:
+            if block.flipped_at_bar is not None and bar_idx - block.flipped_at_bar > 20:
                 new_state = OrderBlockState.CONSUMED
             # Rule 9: RB_FRESH → RB_TESTED (bar returns to zone from new side)
             elif self._touches_zone(block, bar):
@@ -235,43 +239,43 @@ class OrderBlockDetector:
     def detect(self, df: pd.DataFrame, min_displacement_pips: float = 10.0) -> list[OrderBlock]:
         """Detect new Order Blocks from OHLC data.
 
-        Stub only - not implemented in Phase 6.A.
+        Stub only — implemented in Phase 6.B.
         """
-        pass
+        raise NotImplementedError("Phase 6.B")
 
     def update_states(self, df: pd.DataFrame) -> None:
         """Update states of all tracked blocks based on new bars.
 
-        Stub only - not implemented in Phase 6.A.
+        Stub only — implemented in Phase 6.B.
         """
-        pass
+        raise NotImplementedError("Phase 6.B")
 
     def get_active_blocks(
         self, max_age_bars: int = 50, states: Optional[list[OrderBlockState]] = None
     ) -> list[OrderBlock]:
         """Return active blocks filtered by age and state.
 
-        Stub only - not implemented in Phase 6.A.
+        Stub only — implemented in Phase 6.B.
         """
-        pass
+        raise NotImplementedError("Phase 6.B")
 
     def get_nearest_ob(self, price: float, direction: str) -> Optional[OrderBlock]:
         """Get the nearest Order Block to current price in given direction.
 
-        Stub only - not implemented in Phase 6.A.
+        Stub only — implemented in Phase 6.B.
         """
-        pass
+        raise NotImplementedError("Phase 6.B")
 
     def distance_to_ob(self, price: float, direction: str) -> Optional[float]:
         """Calculate distance in pips to nearest OB in given direction.
 
-        Stub only - not implemented in Phase 6.A.
+        Stub only — implemented in Phase 6.B.
         """
-        pass
+        raise NotImplementedError("Phase 6.B")
 
     def htf_priority_filter(self, candidates: list[OrderBlock]) -> list[OrderBlock]:
         """Filter candidates by HTF alignment priority.
 
-        Stub only - not implemented in Phase 6.A.
+        Stub only — implemented in Phase 6.B.
         """
-        pass
+        raise NotImplementedError("Phase 6.B")

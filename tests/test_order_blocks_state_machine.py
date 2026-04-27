@@ -241,17 +241,19 @@ class TestTerminalConditions:
     """Tests for terminal state transitions."""
 
     def test_transition_rb_fresh_consumed_after_timeout(self):
-        """age_bars - flipped_at_bar > 20 → CONSUMED."""
+        """bar_idx - flipped_at_bar > 20 → CONSUMED.
+        flipped_at_bar is an absolute bar index; timeout is checked as
+        bar_idx - flipped_at_bar > 20 (both on same scale).
+        """
         ob = make_bullish_ob()
         ob.state = OrderBlockState.RB_FRESH
-        ob.flipped_at_bar = 100
-        ob.age_bars = 121  # Will check 121 - 100 = 21 > 20
+        ob.flipped_at_bar = 1000  # Formed at absolute index 1000
         detector = OrderBlockDetector("EURUSD", "H4")
 
-        # Bar that doesn't touch zone (just passes time)
+        # Bar that doesn't touch zone, 21 bars later (1021 - 1000 = 21 > 20)
         bar = make_bar(open_=1.1200, high=1.1220, low=1.1180, close=1.1210)
 
-        result = detector.transition(ob, bar, bar_idx=122)
+        result = detector.transition(ob, bar, bar_idx=1021)
 
         assert result is True
         assert ob.state == OrderBlockState.CONSUMED
@@ -286,17 +288,19 @@ class TestTerminalConditions:
         assert ob.state == OrderBlockState.CONSUMED
 
     def test_transition_mitigated_consumed_no_reversal(self):
-        """> 5 bars after mitigation with no reversal → CONSUMED."""
+        """bar_idx - mitigated_at_bar > 5 with no reversal → CONSUMED.
+        mitigated_at_bar is an absolute bar index; timeout is checked as
+        bar_idx - mitigated_at_bar > 5 (both on same scale).
+        """
         ob = make_bullish_ob()
         ob.state = OrderBlockState.OB_MITIGATED
-        ob.mitigated_at_bar = 100
-        ob.age_bars = 106  # Will check 106 - 100 = 6 > 5
+        ob.mitigated_at_bar = 1000  # Mitigated at absolute index 1000
         detector = OrderBlockDetector("EURUSD", "H4")
 
-        # Bar that doesn't reverse (stays below zone for BULLISH OB)
+        # Bar 6 steps later (1006 - 1000 = 6 > 5), no reversal — stays below zone
         bar = make_bar(open_=1.0950, high=1.0970, low=1.0940, close=1.0960)
 
-        result = detector.transition(ob, bar, bar_idx=107)
+        result = detector.transition(ob, bar, bar_idx=1006)
 
         assert result is True
         assert ob.state == OrderBlockState.CONSUMED
