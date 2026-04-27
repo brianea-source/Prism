@@ -66,6 +66,14 @@ class SignalGenerator:
         self.ob_detector = OrderBlockDetector(instrument, "H4")
         self.sweep_detector = SweepDetector(instrument)
         self.po3_detector = Po3Detector(instrument)
+        # Per-detector failure counters (Phase 6.E). Bumped whenever a smart-money
+        # detector raises during ``_evaluate_smart_money``. Surfaced to ops via
+        # logger.error + traceback; expose here so a future metrics layer can read
+        # ``gen.detector_failure_counts`` without touching the log pipeline. Keys
+        # are stable: ``ob`` / ``sweep`` / ``po3``.
+        self.detector_failure_counts: dict[str, int] = {
+            "ob": 0, "sweep": 0, "po3": 0,
+        }
         self._predictor = None
 
     def _load_predictor(self):
@@ -250,13 +258,22 @@ class SignalGenerator:
         ob_max_dist_pips = _env_float("PRISM_OB_MAX_DISTANCE_PIPS", 30.0)
 
         # --- Order Blocks (H4) -----------------------------------------
+        # Detector exceptions must never crash signal generation, but they MUST
+        # be loud — a silently-broken detector during observability rollout is
+        # exactly the failure mode this layer is meant to prevent. Log at error
+        # level with the full traceback (exc_info=True) and bump a counter ops
+        # can scrape via ``gen.detector_failure_counts``.
         try:
             self.ob_detector.detect(h4_df, min_displacement_pips=min_disp_pips)
             self.ob_detector.update_states(h4_df)
             nearest = self.ob_detector.get_nearest_ob(current_price, direction_str)
             ob_distance = self.ob_detector.distance_to_ob(current_price, direction_str)
-        except Exception as exc:  # pragma: no cover — detectors must never crash signal gen
-            logger.warning(f"OrderBlockDetector failed: {exc}")
+        except Exception as exc:
+            self.detector_failure_counts["ob"] += 1
+            logger.error(
+                f"OrderBlockDetector failed for {self.instrument}: {exc}",
+                exc_info=True,
+            )
             nearest = None
             ob_distance = None
 
@@ -278,14 +295,22 @@ class SignalGenerator:
             }
 
         # --- Liquidity Sweep (entry timeframe) -------------------------
+        # On exception we set ``has_recent=False`` deliberately: a broken sweep
+        # detector with ``PRISM_SWEEP_REQUIRED=1`` is treated as "no qualifying
+        # sweep" and the gate blocks. This is fail-closed by design — better
+        # to skip a trade than to fire one without confluence we can't compute.
         try:
             self.sweep_detector.detect(entry_df)
             last_sweep = self.sweep_detector.last_sweep(direction_str)
             has_recent = self.sweep_detector.has_recent_sweep(
                 direction_str, bars_back=5, require_displacement=True
             )
-        except Exception as exc:  # pragma: no cover
-            logger.warning(f"SweepDetector failed: {exc}")
+        except Exception as exc:
+            self.detector_failure_counts["sweep"] += 1
+            logger.error(
+                f"SweepDetector failed for {self.instrument}: {exc}",
+                exc_info=True,
+            )
             last_sweep = None
             has_recent = False
 
@@ -307,12 +332,17 @@ class SignalGenerator:
             }
 
         # --- Po3 phase (entry timeframe, current session) --------------
+        # Same fail-closed contract as the sweep gate.
         session_str = session_label(datetime.now(timezone.utc))
         try:
             po3_state = self.po3_detector.detect_phase(entry_df, session=session_str)
             is_entry_phase = self.po3_detector.is_entry_phase(po3_state)
-        except Exception as exc:  # pragma: no cover
-            logger.warning(f"Po3Detector failed: {exc}")
+        except Exception as exc:
+            self.detector_failure_counts["po3"] += 1
+            logger.error(
+                f"Po3Detector failed for {self.instrument}: {exc}",
+                exc_info=True,
+            )
             po3_state = None
             is_entry_phase = False
 
@@ -328,6 +358,13 @@ class SignalGenerator:
             }
 
         # --- Gating ----------------------------------------------------
+        # Fail-fast ``elif`` chain by design: any single gate failure blocks
+        # the signal, and ``block_reason`` reports the first one in ICT order
+        # of operations — sweep (manipulation) must complete before Po3
+        # (distribution), so a missing sweep is a strictly upstream failure
+        # and that's the more actionable diagnostic to surface. Both gates
+        # still BOTH have to pass for an entry to fire; the elif only changes
+        # which reason wins the log line.
         blocked = False
         block_reason = ""
         if sweep_required and not has_recent:
