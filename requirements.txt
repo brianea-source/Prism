@@ -14,6 +14,10 @@ scikit-learn>=1.3.0
 xgboost>=2.0.0
 lightgbm>=4.0.0
 shap>=0.43.0
+# scipy: pulled in transitively by scikit-learn but Track B's
+# distribution-drift tests (chi-squared GoF, Fisher's exact, KS) depend
+# on it directly — pin explicitly so the dependency is visible.
+scipy>=1.10.0
 
 # Backtesting
 backtesting>=0.3.3

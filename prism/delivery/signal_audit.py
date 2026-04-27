@@ -37,30 +37,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+# Single source of truth for the audit record shape — see prism/audit/schema.py.
+# Re-exported here for backwards compat with any external imports of
+# ``prism.delivery.signal_audit.AUDIT_FIELDS``.
+from prism.audit.schema import AUDIT_FIELDS, TIMESTAMP_FIELD
+
 if TYPE_CHECKING:
     from prism.execution.mt5_bridge import SignalPacket
 
 logger = logging.getLogger(__name__)
 
-
-# Subset of ``SignalPacket`` written to each audit record. Whitelisted
-# explicitly (rather than ``asdict`` + filter) so accidental additions to
-# ``SignalPacket`` don't silently leak unrelated fields into the audit
-# JSONL — the schema is part of the Phase 7.A contract and changes here
-# need to be paired with changes to the historical-replay builder.
-AUDIT_FIELDS = (
-    "instrument",
-    "direction",
-    "confidence",
-    "confidence_level",
-    "signal_id",
-    "signal_time",
-    "model_version",
-    "regime",
-    "news_bias",
-    "htf_bias",
-    "smart_money",
-)
+__all__ = ["AUDIT_FIELDS", "TIMESTAMP_FIELD", "audit_path", "write_signal_audit"]
 
 
 def _enabled() -> bool:
@@ -97,6 +84,15 @@ def write_signal_audit(
 
     Returns the file path on success, ``None`` when audit is disabled or
     the write fails. Never raises — the runner relies on this contract.
+
+    .. warning::
+       Production callers (the runner) **must** pass ``when=now`` so the
+       audit timestamp pins to the scan time, not wall-clock at write.
+       Passing ``when=None`` falls back to ``datetime.now(timezone.utc)``,
+       which is intentional only for ad-hoc CLI / test invocations where
+       the two are equivalent. In replay / back-test runs they diverge
+       by hours-to-years and silent wall-clock time will pollute the
+       audit log with bogus timestamps. PR #21 review item N3.
     """
     if not _enabled():
         return None
@@ -104,7 +100,7 @@ def write_signal_audit(
     try:
         when = when or datetime.now(timezone.utc)
         path = audit_path(signal.instrument, when=when)
-        record = {"audit_ts": when.isoformat()}
+        record = {TIMESTAMP_FIELD: when.isoformat()}
         for field in AUDIT_FIELDS:
             record[field] = getattr(signal, field, None)
 

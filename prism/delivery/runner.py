@@ -27,6 +27,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from prism.delivery.signal_audit import write_signal_audit
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -407,7 +409,6 @@ def _scan_instrument(
     # matters for replay / back-test runs where the two diverge. The
     # audit writer never raises — a broken audit log must not abort
     # delivery to Slack / MT5.
-    from prism.delivery.signal_audit import write_signal_audit
     write_signal_audit(signal, when=now)
 
     # -- Delivery --
