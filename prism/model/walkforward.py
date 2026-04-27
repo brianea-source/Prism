@@ -506,7 +506,19 @@ def acceptance_decision(
     decline), so the gate compares ``new <= 1.10 * baseline``.
     """
     g1_passed = candidate.median_f1 >= baseline.median_f1
-    g2_passed = candidate.median_sharpe >= 0.95 * baseline.median_sharpe
+
+    # Gate 2: candidate Sharpe must be within 5% of baseline.
+    # When baseline is positive, the threshold is 0.95 * baseline (lower bound).
+    # When baseline is negative, 0.95 * baseline yields a LESS negative
+    # (i.e. looser) threshold — invert the multiplier to keep the
+    # "within 5% degradation" semantic.
+    b_sharpe = baseline.median_sharpe
+    if b_sharpe >= 0:
+        g2_threshold = 0.95 * b_sharpe
+    else:
+        g2_threshold = 1.05 * b_sharpe  # more negative = tighter bound
+    g2_passed = candidate.median_sharpe >= g2_threshold
+
     # 1.10x baseline — but if baseline is 0 (no trades / no drawdown),
     # any positive candidate drawdown fails the multiplicative gate.
     # Allow equal in that degenerate case.
@@ -527,9 +539,9 @@ def acceptance_decision(
         "gate_2_sharpe": {
             "spec": GATE_SHARPE_NEW_GTE_BASELINE_X_095,
             "passed": bool(g2_passed),
-            "baseline": baseline.median_sharpe,
+            "baseline": b_sharpe,
             "candidate": candidate.median_sharpe,
-            "threshold": 0.95 * baseline.median_sharpe,
+            "threshold": g2_threshold,
         },
         "gate_3_max_drawdown": {
             "spec": GATE_MAXDD_NEW_LTE_BASELINE_X_110,

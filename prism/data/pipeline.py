@@ -357,14 +357,16 @@ class PRISMFeaturePipeline:
             if col in merged.columns:
                 merged[col] = merged[col].fillna(default)
 
-        join_count = (
-            merged[PHASE_7A_FEATURE_COLUMNS[0]].notna()
-            & (merged["po3_unknown"] != True)  # noqa: E712 — pandas mask
-        ).sum()
+        join_count = merged[PHASE_7A_FEATURE_COLUMNS[0]].notna().sum()
         logger.info(
             "Phase 7.A sidecar merged: %d / %d rows matched a sidecar timestamp",
             join_count, len(merged),
         )
+
+        # Restore the original datetime dtype so downstream code that
+        # expects tz-aware timestamps (or the caller's original dtype)
+        # is not surprised by the tz-strip we did for the join.
+        merged["datetime"] = df["datetime"].values
         return merged
 
     def _load_price_data(self, start_date: str, end_date: str) -> pd.DataFrame:
