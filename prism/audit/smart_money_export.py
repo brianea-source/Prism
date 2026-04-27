@@ -214,14 +214,23 @@ def summarize(df: pd.DataFrame) -> dict:
         )
         presence[sub] = round(float(is_present.mean()), 4)
 
-    confidence = {
-        "mean": float(df["confidence"].mean()),
-        "median": float(df["confidence"].median()),
-        "p25": float(df["confidence"].quantile(0.25)),
-        "p75": float(df["confidence"].quantile(0.75)),
-        "min": float(df["confidence"].min()),
-        "max": float(df["confidence"].max()),
-    }
+    # PR #22 review N3: coerce confidence to numeric defensively. If a
+    # malformed JSONL line slips through with confidence as a string,
+    # df["confidence"].mean() raises TypeError. ``errors="coerce"``
+    # turns the bad rows into NaN and drops them — summary stats stay
+    # representative of the well-formed records.
+    confidence_numeric = pd.to_numeric(df["confidence"], errors="coerce").dropna()
+    if confidence_numeric.empty:
+        confidence = None
+    else:
+        confidence = {
+            "mean": float(confidence_numeric.mean()),
+            "median": float(confidence_numeric.median()),
+            "p25": float(confidence_numeric.quantile(0.25)),
+            "p75": float(confidence_numeric.quantile(0.75)),
+            "min": float(confidence_numeric.min()),
+            "max": float(confidence_numeric.max()),
+        }
 
     ts = pd.to_datetime(df[TIMESTAMP_FIELD], utc=True)
     date_range = [ts.min().isoformat(), ts.max().isoformat()]
@@ -251,7 +260,11 @@ FEATURE_TYPES: tuple[str, ...] = (
 
 
 def _chi_squared_gof(
-    live: pd.Series, historical: pd.Series
+    live: pd.Series,
+    historical: pd.Series,
+    *,
+    strict_novel_bins: bool = False,
+    **_,
 ) -> tuple[float, float, str]:
     """Chi-squared goodness-of-fit: live observed vs historical expected.
 
@@ -261,7 +274,22 @@ def _chi_squared_gof(
     bars vs. weeks of live audits) — historical is treated as ground
     truth, deviations get attributed to live or to builder bugs.
 
-    Returns ``(statistic, p_value, test_name)``.
+    Args:
+        live: Observed sample (live audit log).
+        historical: Reference sample (historical replay builder).
+        strict_novel_bins: If True, raise when ``live`` contains values
+            in bins absent from ``historical``. Default False — emits a
+            WARNING instead and proceeds with the surviving bins, which
+            biases the gate low. PR #22 review item B2.
+
+    Returns:
+        ``(statistic, p_value, test_name)``.
+
+    Raises:
+        ValueError: when both samples are empty, when no historical bins
+            have non-zero proportion, when fewer than 2 bins survive the
+            historical mask (degenerate chi-squared with df=0 — see B1),
+            or when ``strict_novel_bins=True`` and live has novel bins.
     """
     from scipy.stats import chisquare
 
@@ -279,15 +307,45 @@ def _chi_squared_gof(
     expected = (hist_counts / n_hist) * n_live
 
     # Drop bins where the historical proportion is zero — chi-squared
-    # is undefined when E[i] = 0. With those bins gone we may need to
-    # rescale so observed and expected sums match (chisquare requires
-    # equal totals).
+    # is undefined when E[i] = 0. mask=False precisely on bins absent
+    # from historical.
     mask = expected > 0
     if not mask.any():
         raise ValueError("no bins with non-zero historical proportion")
 
+    # PR #22 review B2: detect live observations in bins absent from
+    # historical. These get silently excluded by the mask below — a
+    # real risk when, e.g., a model bump introduces a new label
+    # post-training. Warn by default; strict mode raises.
+    novel_mask = (~mask) & (live_counts > 0)
+    if novel_mask.any():
+        novel_bins = list(live_counts.index[novel_mask])
+        novel_obs = int(live_counts[novel_mask].sum())
+        msg = (
+            f"chi-squared GoF: live has {novel_obs} observations in "
+            f"{len(novel_bins)} bin(s) absent from historical "
+            f"({novel_bins!r}). These will be excluded — gate-5 result "
+            f"will be biased low."
+        )
+        if strict_novel_bins:
+            raise ValueError(msg)
+        logger.warning(msg)
+
     live_kept = live_counts[mask].values
     expected_kept = expected[mask].values
+
+    # PR #22 review B1: chi-squared GoF needs ≥2 surviving bins. With
+    # k=1, df = k - 1 = 0 — scipy's chisquare returns either nan
+    # (silent false negative) or a degenerate stat that always rejects.
+    # Refuse rather than emit a misleading p-value. Common in practice
+    # when historical is an all-same-value sample (stuck detector).
+    if len(live_kept) < 2:
+        raise ValueError(
+            "chi-squared GoF requires ≥2 non-zero bins in historical; "
+            "got an all-same-value historical sample (degenerate test, "
+            "df=0)"
+        )
+
     expected_kept = expected_kept * (live_kept.sum() / expected_kept.sum())
 
     statistic, p_value = chisquare(live_kept, expected_kept)
@@ -295,9 +353,15 @@ def _chi_squared_gof(
 
 
 def _fishers_exact(
-    live: pd.Series, historical: pd.Series
+    live: pd.Series, historical: pd.Series, **_,
 ) -> tuple[float, float, str]:
-    """Fisher's exact on a 2x2 contingency. Rows = sample, cols = bool."""
+    """Fisher's exact on a 2x2 contingency. Rows = sample, cols = bool.
+
+    Accepts and ignores extra kwargs (e.g. ``strict_novel_bins``) so the
+    dispatch table in :func:`compare_feature` can pass kwargs uniformly
+    without per-test branching. A 2x2 contingency has no novel-bin
+    failure mode by construction.
+    """
     from scipy.stats import fisher_exact
 
     def _coerce(s: pd.Series) -> pd.Series:
@@ -320,9 +384,15 @@ def _fishers_exact(
 
 
 def _ks_two_sample(
-    live: pd.Series, historical: pd.Series
+    live: pd.Series, historical: pd.Series, **_,
 ) -> tuple[float, float, str]:
-    """Kolmogorov-Smirnov two-sample on continuous data."""
+    """Kolmogorov-Smirnov two-sample on continuous data.
+
+    Accepts and ignores extra kwargs (e.g. ``strict_novel_bins``) so the
+    dispatch table in :func:`compare_feature` can pass kwargs uniformly.
+    KS is on continuous distributions and has no notion of "bins" — the
+    novel-bin concept simply doesn't apply.
+    """
     from scipy.stats import ks_2samp
 
     live_clean = live.dropna().astype(float).values
@@ -348,6 +418,7 @@ def compare_feature(
     *,
     feature_type: str,
     alpha: float = 0.01,
+    strict_novel_bins: bool = False,
 ) -> dict:
     """Run the gate-5 drift test for one feature.
 
@@ -358,6 +429,11 @@ def compare_feature(
         alpha: Per-test significance threshold. Default 0.01 matches
             the Bonferroni-corrected per-feature α from
             PHASE_7A_SCOPE.md §6.1.
+        strict_novel_bins: If True, raise when a chi-squared test sees
+            live observations in bins absent from historical. Default
+            False — emits a WARNING. Only meaningful for
+            ``feature_type`` of ``int_ordinal`` or ``categorical``;
+            ignored by Fisher's exact and KS. PR #22 review item B2.
 
     Returns:
         A dict with keys ``feature_type``, ``test``, ``statistic``,
@@ -370,7 +446,9 @@ def compare_feature(
         )
 
     test_fn = _TEST_DISPATCH[feature_type]
-    statistic, p_value, test_name = test_fn(live, historical)
+    statistic, p_value, test_name = test_fn(
+        live, historical, strict_novel_bins=strict_novel_bins,
+    )
 
     return {
         "feature_type": feature_type,
@@ -391,6 +469,7 @@ def compare_features(
     *,
     family_alpha: float = 0.05,
     max_rejections_for_pass: int = 1,
+    strict_novel_bins: bool = False,
 ) -> dict:
     """Run the gate-5 drift gate across multiple features.
 
@@ -411,10 +490,30 @@ def compare_features(
         feature_specs: List of ``(column_name, feature_type)`` tuples.
         family_alpha: Family-wise α (default 0.05).
         max_rejections_for_pass: Pass threshold (default 1, per §6.1).
+        strict_novel_bins: Forwarded to chi-squared tests. See
+            :func:`compare_feature`.
 
     Returns:
         Aggregate result dict with per-feature results and overall
         ``passed`` boolean.
+
+    Notes:
+        **po3_phase encoding (cross-reference with Phase 7.A impl PR).**
+        ``feature_engineering.enrich`` exposes ``po3_phase`` two ways:
+
+        * a single 4-category label column ``po3_phase``
+          (values: ``accumulation``, ``manipulation``, ``distribution``,
+          ``unknown``);
+        * four one-hot bool columns ``po3_accumulation``,
+          ``po3_manipulation``, ``po3_distribution``, ``po3_unknown``.
+
+        For gate-5, pass the **single label column** as
+        ``("po3_phase", "categorical")`` — one chi-squared GoF on the
+        joint 4-cat distribution per PHASE_7A_SCOPE.md §6.1. Iterating
+        the four one-hot columns and running four separate Fisher's
+        exacts double-counts the family α and is the wrong answer
+        statistically; the one-hot columns exist for downstream ML
+        feature ingestion, not gate-5.
     """
     n = len(feature_specs)
     if n == 0:
@@ -431,7 +530,9 @@ def compare_features(
             raise KeyError(f"historical_df missing column {col!r}")
         result = compare_feature(
             live_df[col], historical_df[col],
-            feature_type=ftype, alpha=per_feature_alpha,
+            feature_type=ftype,
+            alpha=per_feature_alpha,
+            strict_novel_bins=strict_novel_bins,
         )
         result["feature"] = col
         per_feature_results.append(result)
@@ -526,6 +627,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_diff.add_argument("--family-alpha", type=float, default=0.05)
     p_diff.add_argument("--max-rejections", type=int, default=1)
+    p_diff.add_argument(
+        "--strict-novel-bins", action="store_true",
+        help=(
+            "Raise (instead of warn) when chi-squared tests see live "
+            "observations in bins absent from historical. Recommended "
+            "for production gate-5 runs once the historical builder "
+            "is stable."
+        ),
+    )
 
     return parser
 
@@ -565,6 +675,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             live_df, hist_df, args.features,
             family_alpha=args.family_alpha,
             max_rejections_for_pass=args.max_rejections,
+            strict_novel_bins=args.strict_novel_bins,
         )
         print(json.dumps(result, indent=2, default=str))
         return 0 if result["passed"] else 1
