@@ -578,6 +578,37 @@ class TestCompareFeatures:
                 strict_novel_bins=True,
             )
 
+    def test_warning_mode_plumbed_through_compare_features(self, caplog):
+        """B2 carry-in from PR #23 review: warning-mode plumbing through
+        ``compare_features`` had no dedicated caplog test, only at the
+        ``compare_feature`` (single-feature) level. Confirm here that
+        the default mode (no ``strict_novel_bins``) emits the warning
+        through the multi-feature dispatcher and still returns a
+        valid decision."""
+        rng = np.random.default_rng(seed=29)
+        live_df = pd.DataFrame({
+            "htf_alignment": np.concatenate([
+                rng.choice([0, 1, 2, 3], size=300), np.full(50, 4),
+            ]),
+        })
+        hist_df = pd.DataFrame({
+            "htf_alignment": rng.choice([0, 1, 2, 3], size=2000),
+        })
+        specs = [("htf_alignment", "int_ordinal")]
+
+        with caplog.at_level(
+            "WARNING", logger="prism.audit.smart_money_export",
+        ):
+            result = compare_features(live_df, hist_df, specs)
+
+        warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("absent from historical" in m for m in warnings), (
+            f"expected warning about novel bins, got: {warnings}"
+        )
+        # The decision still completed — warning didn't short-circuit
+        assert "passed" in result
+        assert "rejections" in result
+
 
 # ---------------------------------------------------------------------------
 # CLI
