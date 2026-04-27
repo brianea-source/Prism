@@ -53,6 +53,11 @@ class SweepDetector:
         # Index of the last bar seen by ``detect()`` — anchors ``has_recent_sweep``.
         self._latest_scanned_bar: Optional[int] = None
 
+    @property
+    def latest_scanned_bar(self) -> Optional[int]:
+        """Public accessor for the last bar index seen by :meth:`detect`."""
+        return self._latest_scanned_bar
+
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------

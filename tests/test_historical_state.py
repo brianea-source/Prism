@@ -34,6 +34,7 @@ from prism.data.historical_state import (
     build_replay_sidecar,
     main,
     read_replay_sidecar,
+    read_sidecar_metadata,
 )
 
 
@@ -386,3 +387,61 @@ class TestCLI:
         meta = json.loads(result.stdout)
         assert meta["instrument"] == "EURUSD"
         assert out_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# N2: Parquet sidecar metadata (PRISM_OB_MAX_DISTANCE_PIPS audit trail)
+# ---------------------------------------------------------------------------
+
+
+class TestSidecarMetadata:
+
+    def test_metadata_contains_instrument_and_ob_distance(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PRISM_OB_MAX_DISTANCE_PIPS", "42.5")
+        df_h4, df_h1, df_entry = _frames(n_entry=50)
+        out = tmp_path / "sidecar.parquet"
+        build_replay_sidecar(
+            instrument="XAUUSD",
+            df_h4=df_h4, df_h1=df_h1, df_entry=df_entry,
+            output_path=out,
+        )
+        meta = read_sidecar_metadata(out)
+        assert meta["prism.instrument"] == "XAUUSD"
+        assert meta["prism.ob_max_distance_pips"] == "42.5"
+        assert "prism.built_at" in meta
+
+    def test_metadata_empty_string_when_env_unset(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("PRISM_OB_MAX_DISTANCE_PIPS", raising=False)
+        df_h4, df_h1, df_entry = _frames(n_entry=50)
+        out = tmp_path / "sidecar.parquet"
+        build_replay_sidecar(
+            instrument="EURUSD",
+            df_h4=df_h4, df_h1=df_h1, df_entry=df_entry,
+            output_path=out,
+        )
+        meta = read_sidecar_metadata(out)
+        assert meta["prism.ob_max_distance_pips"] == ""
+
+    def test_read_sidecar_metadata_on_non_prism_parquet(self, tmp_path):
+        df = pd.DataFrame({"a": [1, 2]})
+        out = tmp_path / "plain.parquet"
+        df.to_parquet(out, index=False)
+        meta = read_sidecar_metadata(out)
+        assert meta == {}
+
+
+# ---------------------------------------------------------------------------
+# N3: SweepDetector.latest_scanned_bar public property
+# ---------------------------------------------------------------------------
+
+
+class TestSweepDetectorProperty:
+
+    def test_latest_scanned_bar_property_matches_private(self):
+        from prism.signal.sweeps import SweepDetector
+        det = SweepDetector("EURUSD")
+        assert det.latest_scanned_bar is None
+        df_entry = _synthetic_ohlc(50, freq="5min", seed=7)
+        det.detect(df_entry)
+        assert det.latest_scanned_bar == 49
+        assert det.latest_scanned_bar == det._latest_scanned_bar

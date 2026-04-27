@@ -229,6 +229,35 @@ class TestAcceptanceDecision:
         assert "gate_2" in decision["rationale"]
         assert "gate_3" in decision["rationale"]
 
+    def test_gate_2_negative_baseline_sharpe_tightens(self):
+        """When baseline Sharpe is negative, the threshold must become
+        *more* negative (tighter) than 0.95 × baseline. Otherwise
+        0.95 × −1.0 = −0.95 (less negative → looser) and candidates
+        that perform worse can sneak through.
+
+        With the fix, threshold = 1.05 × −1.0 = −1.05, so a candidate
+        at −1.03 passes (better than −1.05) while −1.06 fails."""
+        baseline = _result(f1=0.40, sharpe=-1.0, max_dd=0.10)
+
+        better = _result(f1=0.40, sharpe=-1.03, max_dd=0.10)
+        worse = _result(f1=0.40, sharpe=-1.06, max_dd=0.10)
+
+        d_better = acceptance_decision(baseline, better)
+        d_worse = acceptance_decision(baseline, worse)
+
+        assert d_better["gates"]["gate_2_sharpe"]["passed"] is True
+        assert d_worse["gates"]["gate_2_sharpe"]["passed"] is False
+        # Threshold should be 1.05 * -1.0 = -1.05
+        assert d_better["gates"]["gate_2_sharpe"]["threshold"] == pytest.approx(-1.05)
+
+    def test_gate_2_zero_baseline_sharpe(self):
+        """Zero baseline Sharpe: threshold = 0.0, candidate must be >= 0."""
+        baseline = _result(f1=0.40, sharpe=0.0, max_dd=0.10)
+        pos = _result(f1=0.40, sharpe=0.01, max_dd=0.10)
+        neg = _result(f1=0.40, sharpe=-0.01, max_dd=0.10)
+        assert acceptance_decision(baseline, pos)["gates"]["gate_2_sharpe"]["passed"] is True
+        assert acceptance_decision(baseline, neg)["gates"]["gate_2_sharpe"]["passed"] is False
+
 
 # ---------------------------------------------------------------------------
 # End-to-end run_walkforward

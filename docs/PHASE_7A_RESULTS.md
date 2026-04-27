@@ -36,7 +36,7 @@ For each instrument, the pipeline that produces the rows below is:
 # 1. Stage 1 audit log already accumulating in state/signal_audit/<instrument>/
 #    (see docs/PHASE_6_ROLLOUT.md §2 pre-flight)
 
-# 2. Build the historical state sidecar
+# 2a. Build the FULL historical state sidecar (all bars — for training)
 python -m prism.data.historical_state \
     --instrument EURUSD \
     --h4 data/EURUSD_h4.parquet \
@@ -44,19 +44,38 @@ python -m prism.data.historical_state \
     --entry data/EURUSD_h1.parquet \
     --output models/historical_state_EURUSD.parquet
 
+# 2b. Build the SIGNAL-CONDITIONED sidecar (gate-5 comparison population)
+#     Gate-5 compares live audit-log bars (signal-producing only) against
+#     the historical builder. The live side is already signal-conditioned;
+#     the historical side must be too, otherwise selection-bias differences
+#     dominate the drift test.
+python -m prism.data.historical_state \
+    --instrument EURUSD \
+    --h4 data/EURUSD_h4.parquet \
+    --h1 data/EURUSD_h1.parquet \
+    --entry data/EURUSD_h1.parquet \
+    --signal-conditioned-only \
+    --output models/historical_state_EURUSD_conditioned.parquet
+
 # 3. Run gate 5 first — if it fails, fix the historical builder before
-#    spending compute on retraining
+#    spending compute on retraining.
+#    ⚠️  Use the CONDITIONED sidecar from step 2b, not the full sidecar.
 python -m prism.audit.smart_money_export diff \
     --start 2026-04-27 --end 2026-05-25 \
     --instrument EURUSD \
-    --historical models/historical_state_EURUSD.parquet \
+    --historical models/historical_state_EURUSD_conditioned.parquet \
     --features htf_alignment:int_ordinal \
     --features kill_zone_strength:int_ordinal \
     --features sweep_confirmed:bool \
     --features ob_distance_pips:continuous \
     --features po3_phase:categorical
 
-# 4. Retrain with walk-forward, gates 1-3 evaluation
+# 4. Retrain with walk-forward, gates 1-3 evaluation.
+#    ⚠️  Confirm PRISM_OB_MAX_DISTANCE_PIPS matches the value used
+#    during Stage 1 (check sidecar metadata with:
+#      python -c "from prism.data.historical_state import read_sidecar_metadata; \
+#                 print(read_sidecar_metadata('models/historical_state_EURUSD.parquet'))")
+PRISM_OB_MAX_DISTANCE_PIPS=50 \
 python prism/model/retrain.py \
     --instrument EURUSD \
     --walkforward \

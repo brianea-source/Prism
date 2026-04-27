@@ -49,12 +49,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from prism.audit.schema import ALL_FIELDS, TIMESTAMP_FIELD
 from prism.signal.htf_bias import Bias, get_htf_bias
@@ -224,8 +227,8 @@ class HistoricalStateBuilder:
         sweep_dict: Optional[dict] = None
         if last_sweep is not None:
             anchor = (
-                self.sweep_detector._latest_scanned_bar
-                if self.sweep_detector._latest_scanned_bar is not None
+                self.sweep_detector.latest_scanned_bar
+                if self.sweep_detector.latest_scanned_bar is not None
                 else last_sweep.sweep_bar
             )
             sweep_dict = {
@@ -406,6 +409,37 @@ class HistoricalStateBuilder:
 # ---------------------------------------------------------------------------
 
 
+def _sidecar_metadata(instrument: str) -> dict[bytes, bytes]:
+    """Build the Parquet file-level metadata dict for audit trail.
+
+    Captures ``PRISM_OB_MAX_DISTANCE_PIPS`` at write time so the
+    sidecar is self-describing even when reused across retrain runs
+    with a different environment.
+    """
+    ob_max = os.environ.get("PRISM_OB_MAX_DISTANCE_PIPS", "")
+    return {
+        b"prism.instrument": instrument.encode(),
+        b"prism.ob_max_distance_pips": ob_max.encode(),
+        b"prism.built_at": datetime.now(timezone.utc).isoformat().encode(),
+    }
+
+
+def read_sidecar_metadata(path: Path | str) -> dict[str, str]:
+    """Read the custom metadata block written by :func:`build_replay_sidecar`.
+
+    Returns a plain ``{str: str}`` dict (empty when the file has no
+    ``prism.*`` keys). Does NOT load the full DataFrame — only reads
+    the Parquet footer.
+    """
+    pf = pq.read_metadata(str(path))
+    raw = pf.schema.to_arrow_schema().metadata or {}
+    return {
+        k.decode(): v.decode()
+        for k, v in raw.items()
+        if k.startswith(b"prism.")
+    }
+
+
 def build_replay_sidecar(
     instrument: str,
     df_h4: pd.DataFrame,
@@ -419,6 +453,9 @@ def build_replay_sidecar(
     """Run the builder and persist the result to parquet.
 
     Returns the resolved output path. Parent directories are created.
+    The Parquet file embeds ``prism.ob_max_distance_pips`` and build
+    timestamp in the file-level metadata (read via
+    :func:`read_sidecar_metadata`).
     """
     builder = HistoricalStateBuilder(
         instrument=instrument,
@@ -429,7 +466,12 @@ def build_replay_sidecar(
     df = builder.build()
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(output, index=False)
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    merged_meta = {**(table.schema.metadata or {}), **_sidecar_metadata(instrument)}
+    table = table.replace_schema_metadata(merged_meta)
+    pq.write_table(table, str(output))
+
     logger.info(
         "Wrote %d historical state rows for %s to %s",
         len(df), instrument, output,
