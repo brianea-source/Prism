@@ -256,6 +256,23 @@ def test_catch_up_when_detect_after_update_states():
     assert ob.state == OrderBlockState.OB_TESTED
 
 
+def test_detect_idempotent_across_calls():
+    rows = [
+        _eur_row(1.1060, 1.1065, 1.1055, 1.1062),
+        _eur_row(1.1060, 1.1062, 1.1040, 1.1042),
+        _eur_row(1.1045, 1.1075, 1.1041, 1.1070),
+        _eur_row(1.1070, 1.1100, 1.1045, 1.1095),
+    ]
+    df = pd.DataFrame(rows)
+    det = OrderBlockDetector("EURUSD", "H4")
+    first = det.detect(df, min_displacement_pips=10.0)
+    n1 = len(det.blocks)
+    second = det.detect(df, min_displacement_pips=10.0)
+    assert first  # at least one detected on first call
+    assert second == []
+    assert len(det.blocks) == n1
+
+
 def test_get_nearest_ob_invalid_direction_returns_none():
     det = OrderBlockDetector("EURUSD", "H4")
     det.blocks.append(

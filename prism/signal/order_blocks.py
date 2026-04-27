@@ -351,7 +351,8 @@ class OrderBlockDetector:
         min_move = float(min_displacement_pips) * pip
         lookback = 50
         new_blocks: list[OrderBlock] = []
-        seen: set[tuple[str, int]] = set()
+        # Seed with already-tracked blocks so repeated detect() calls don't dup.
+        seen: set[tuple[str, int]] = {(b.direction, b.formed_bar) for b in self.blocks}
 
         for disp_end in range(2, len(df)):
             # --- Bullish OB (demand): last bearish before upward displacement ---
