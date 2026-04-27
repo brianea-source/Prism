@@ -1,7 +1,7 @@
-"""Order Block state machine for PRISM Phase 6.A.
+"""Order Block detection and OB/RB lifecycle state machine (PRISM Phase 6).
 
-This module implements the OB/RB state machine with 8 states and 13 transition rules.
-Phase 6.A scope: state machine only, no detect() or update_states() logic.
+Phase 6.A: 8-state enum, ``OrderBlock`` dataclass, ``transition()`` rules.
+Phase 6.B: ``detect()``, ``update_states()``, distance / nearest / HTF helpers.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from enum import Enum
 from typing import Optional
 
 import pandas as pd
+
+from prism.execution.mt5_bridge import PIP_SIZE
 
 
 class OrderBlockState(str, Enum):
@@ -47,6 +49,9 @@ class OrderBlock:
     test_count: int = 0
     transition_log: list = field(default_factory=list)  # [(bar_idx, old_state, new_state), ...]
     reset_cycles: int = 0  # track how many RESPECTED→FRESH resets have happened
+    # First bar index where ``transition()`` applies (after displacement closes). If
+    # None, ``formed_bar + 1`` is used so manual/test blocks behave as before.
+    activation_bar: Optional[int] = None
 
     @property
     def is_rejection_block(self) -> bool:
@@ -71,6 +76,25 @@ class OrderBlock:
         return self.direction
 
 
+_TF_RANK = {
+    "MN1": 10,
+    "W1": 9,
+    "D1": 8,
+    "DAILY": 8,
+    "H4": 7,
+    "H2": 6,
+    "H1": 5,
+    "M30": 4,
+    "M15": 3,
+    "M5": 2,
+    "M1": 1,
+}
+
+
+def _timeframe_rank(tf: str) -> int:
+    return _TF_RANK.get((tf or "").upper(), 0)
+
+
 class OrderBlockDetector:
     """Detects and manages Order Block lifecycle states."""
 
@@ -78,6 +102,75 @@ class OrderBlockDetector:
         self.instrument = instrument
         self.timeframe = timeframe
         self.blocks: list[OrderBlock] = []
+        # Next bar index ``update_states`` will apply (0-based). Grows monotonically
+        # for a lengthening ``df`` so replays stay idempotent.
+        self._cursor: int = 0
+
+    def _pip_size(self) -> float:
+        return float(PIP_SIZE.get(self.instrument, 0.0001))
+
+    @staticmethod
+    def _require_ohlc(df: pd.DataFrame) -> None:
+        for col in ("open", "high", "low", "close"):
+            if col not in df.columns:
+                raise ValueError(f"DataFrame missing required column: {col}")
+
+    def _bar_timestamp(self, df: pd.DataFrame, idx: int) -> str:
+        if isinstance(df.index, pd.DatetimeIndex):
+            ts = df.index[idx]
+            if hasattr(ts, "isoformat"):
+                return ts.isoformat()
+            return str(ts)
+        return f"bar-{idx}"
+
+    @staticmethod
+    def _is_bearish(row: pd.Series) -> bool:
+        return bool(row["close"] < row["open"])
+
+    @staticmethod
+    def _is_bullish(row: pd.Series) -> bool:
+        return bool(row["close"] > row["open"])
+
+    def _find_last_bearish(self, df: pd.DataFrame, before: int, lookback: int) -> Optional[int]:
+        lo = max(0, before - lookback)
+        for k in range(before - 1, lo - 1, -1):
+            if self._is_bearish(df.iloc[k]):
+                return k
+        return None
+
+    def _find_last_bullish(self, df: pd.DataFrame, before: int, lookback: int) -> Optional[int]:
+        lo = max(0, before - lookback)
+        for k in range(before - 1, lo - 1, -1):
+            if self._is_bullish(df.iloc[k]):
+                return k
+        return None
+
+    def _activation_idx(self, block: OrderBlock) -> int:
+        if block.activation_bar is not None:
+            return int(block.activation_bar)
+        return int(block.formed_bar) + 1
+
+    @staticmethod
+    def _normalize_wanted_effective(direction: str) -> Optional[str]:
+        m = {
+            "LONG": "BULLISH",
+            "BUY": "BULLISH",
+            "BULLISH": "BULLISH",
+            "SHORT": "BEARISH",
+            "SELL": "BEARISH",
+            "BEARISH": "BEARISH",
+        }
+        return m.get(direction.strip().upper())
+
+    def _catch_up_new_blocks(self, df: pd.DataFrame, new_blocks: list[OrderBlock]) -> None:
+        """Apply already-processed bars [activation, cursor) to blocks added mid-stream."""
+        if self._cursor <= 0 or not new_blocks:
+            return
+        n = len(df)
+        for ob in new_blocks:
+            start = self._activation_idx(ob)
+            for idx in range(start, min(self._cursor, n)):
+                self.transition(ob, df.iloc[idx], idx)
 
     def _touches_zone(self, block: OrderBlock, bar: pd.Series) -> bool:
         """Check if bar's range enters the block zone."""
@@ -237,45 +330,157 @@ class OrderBlockDetector:
         return False
 
     def detect(self, df: pd.DataFrame, min_displacement_pips: float = 10.0) -> list[OrderBlock]:
-        """Detect new Order Blocks from OHLC data.
+        """Scan for Order Blocks and append new ones in ``OB_FRESH`` state.
 
-        Stub only — implemented in Phase 6.B.
+        - **Bullish OB:** last bearish candle before bullish displacement
+          (impulse high clears the zone high by at least ``min_displacement_pips``).
+        - **Bearish OB:** last bullish candle before bearish displacement
+          (impulse low clears the zone low by at least ``min_displacement_pips``).
+
+        Returns the list of blocks newly appended in this call (same objects as in
+        ``self.blocks``). Idempotent per (direction, ``formed_bar``): at most one OB
+        per opposing-candle index per scan.
         """
-        raise NotImplementedError("Phase 6.B")
+        if df.empty:
+            return []
+        self._require_ohlc(df)
+        if len(df) < 3:
+            return []
+
+        pip = self._pip_size()
+        min_move = float(min_displacement_pips) * pip
+        lookback = 50
+        new_blocks: list[OrderBlock] = []
+        # Seed with already-tracked blocks so repeated detect() calls don't dup.
+        seen: set[tuple[str, int]] = {(b.direction, b.formed_bar) for b in self.blocks}
+
+        for disp_end in range(2, len(df)):
+            # --- Bullish OB (demand): last bearish before upward displacement ---
+            k_bear = self._find_last_bearish(df, disp_end, lookback)
+            if k_bear is not None:
+                key = ("BULLISH", k_bear)
+                if key not in seen:
+                    row_k = df.iloc[k_bear]
+                    hi = float(df.iloc[k_bear + 1 : disp_end + 1]["high"].max())
+                    lo_k = float(row_k["low"])
+                    move = hi - lo_k
+                    if move >= min_move and hi > float(row_k["high"]):
+                        seen.add(key)
+                        high = float(row_k["high"])
+                        low = float(row_k["low"])
+                        ob = OrderBlock(
+                            instrument=self.instrument,
+                            timeframe=self.timeframe,
+                            direction="BULLISH",
+                            high=high,
+                            low=low,
+                            midpoint=(high + low) / 2.0,
+                            formed_at=self._bar_timestamp(df, k_bear),
+                            formed_bar=int(k_bear),
+                            displacement_size=round(move / pip, 4),
+                            state=OrderBlockState.OB_FRESH,
+                            activation_bar=int(disp_end) + 1,
+                        )
+                        self.blocks.append(ob)
+                        new_blocks.append(ob)
+
+            # --- Bearish OB (supply): last bullish before downward displacement ---
+            k_bull = self._find_last_bullish(df, disp_end, lookback)
+            if k_bull is not None:
+                key = ("BEARISH", k_bull)
+                if key not in seen:
+                    row_k = df.iloc[k_bull]
+                    lo = float(df.iloc[k_bull + 1 : disp_end + 1]["low"].min())
+                    hi_k = float(row_k["high"])
+                    move = hi_k - lo
+                    if move >= min_move and lo < float(row_k["low"]):
+                        seen.add(key)
+                        high = float(row_k["high"])
+                        low = float(row_k["low"])
+                        ob = OrderBlock(
+                            instrument=self.instrument,
+                            timeframe=self.timeframe,
+                            direction="BEARISH",
+                            high=high,
+                            low=low,
+                            midpoint=(high + low) / 2.0,
+                            formed_at=self._bar_timestamp(df, k_bull),
+                            formed_bar=int(k_bull),
+                            displacement_size=round(move / pip, 4),
+                            state=OrderBlockState.OB_FRESH,
+                            activation_bar=int(disp_end) + 1,
+                        )
+                        self.blocks.append(ob)
+                        new_blocks.append(ob)
+
+        self._catch_up_new_blocks(df, new_blocks)
+        return new_blocks
 
     def update_states(self, df: pd.DataFrame) -> None:
-        """Update states of all tracked blocks based on new bars.
+        """Walk ``df`` from ``_cursor`` forward, calling ``transition()`` once per bar per block.
 
-        Stub only — implemented in Phase 6.B.
+        Call after ``detect()`` (or on its own when blocks already exist). Safe to call
+        repeatedly with the same ``df`` length: already-applied bars are skipped.
         """
-        raise NotImplementedError("Phase 6.B")
+        if df.empty:
+            return
+        self._require_ohlc(df)
+        n = len(df)
+        for idx in range(self._cursor, n):
+            bar = df.iloc[idx]
+            for block in self.blocks:
+                if idx >= self._activation_idx(block):
+                    self.transition(block, bar, idx)
+        self._cursor = n
 
     def get_active_blocks(
         self, max_age_bars: int = 50, states: Optional[list[OrderBlockState]] = None
     ) -> list[OrderBlock]:
-        """Return active blocks filtered by age and state.
-
-        Stub only — implemented in Phase 6.B.
-        """
-        raise NotImplementedError("Phase 6.B")
+        """Return non-``CONSUMED`` blocks with ``age_bars <= max_age_bars``, optionally by state."""
+        out: list[OrderBlock] = []
+        for b in self.blocks:
+            if b.state == OrderBlockState.CONSUMED:
+                continue
+            if states is not None and b.state not in states:
+                continue
+            if b.age_bars > max_age_bars:
+                continue
+            out.append(b)
+        return out
 
     def get_nearest_ob(self, price: float, direction: str) -> Optional[OrderBlock]:
-        """Get the nearest Order Block to current price in given direction.
+        """Nearest active block whose ``effective_direction`` matches trade *direction*."""
+        want = self._normalize_wanted_effective(direction)
+        if want is None:
+            return None
+        candidates = [b for b in self.get_active_blocks() if b.effective_direction == want]
+        if not candidates:
+            return None
+        pip = self._pip_size()
 
-        Stub only — implemented in Phase 6.B.
-        """
-        raise NotImplementedError("Phase 6.B")
+        def dist_mid(b: OrderBlock) -> float:
+            return abs(float(price) - b.midpoint) / pip
+
+        return min(candidates, key=dist_mid)
 
     def distance_to_ob(self, price: float, direction: str) -> Optional[float]:
-        """Calculate distance in pips to nearest OB in given direction.
-
-        Stub only — implemented in Phase 6.B.
-        """
-        raise NotImplementedError("Phase 6.B")
+        """Distance in pips from *price* to the midpoint of the nearest matching block."""
+        ob = self.get_nearest_ob(price, direction)
+        if ob is None:
+            return None
+        pip = self._pip_size()
+        return round(abs(float(price) - ob.midpoint) / pip, 4)
 
     def htf_priority_filter(self, candidates: list[OrderBlock]) -> list[OrderBlock]:
-        """Filter candidates by HTF alignment priority.
-
-        Stub only — implemented in Phase 6.B.
-        """
-        raise NotImplementedError("Phase 6.B")
+        """When midpoints sit within 5 pips, keep the highest-``timeframe`` block only."""
+        if not candidates:
+            return []
+        pip = self._pip_size()
+        tol = 5.0 * pip
+        ordered = sorted(candidates, key=lambda b: (-_timeframe_rank(b.timeframe), b.formed_bar))
+        kept: list[OrderBlock] = []
+        for c in ordered:
+            if any(abs(c.midpoint - k.midpoint) <= tol for k in kept):
+                continue
+            kept.append(c)
+        return kept
