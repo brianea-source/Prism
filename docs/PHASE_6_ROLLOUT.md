@@ -35,12 +35,18 @@ Each stage is a single env-var flip with single-env-var rollback.
 ## 2. Pre-flight checklist (run on the production runner)
 
 ```bash
-git pull origin main && git log -1 --oneline   # expect >= 3f08061
+git pull origin main && git log -1 --oneline   # confirm tip includes Phase 6.E + 7.A
 python3 -m pytest tests/ -q                    # expect >= 468 passed
 ```
 
 Confirm:
 
+- **`prism/delivery/signal_audit.py` is deployed and `PRISM_SIGNAL_AUDIT_ENABLED=1`.**
+  Verify by confirming `state/signal_audit/<instrument>/YYYY-MM-DD.jsonl` is
+  being written after the first scan. **Without this, Stage 1 is Slack-only
+  observability** — `docs/PHASE_7A_SCOPE.md` §4.3 makes the audit log the
+  prerequisite for the Phase 7.A validation path. No JSONL = no source data
+  for gate 5 = no way to detect historical-builder drift before retraining.
 - `PRISM_SLACK_TOKEN` is live and the runner can post — the Stage 1 indicator
   is the new `🎯 Smart Money` block landing in `#prism-signals`. If the Slack
   card looks unchanged after Stage 1, **stop** and check the deployment.
@@ -63,6 +69,13 @@ PRISM_SMART_MONEY_ENABLED=1
 PRISM_SWEEP_REQUIRED=0
 PRISM_PO3_REQUIRED=0
 ```
+
+> ⚠️ **Both sub-flags default to `1` in code** (`generator.py:255–256`). All
+> three vars must be set explicitly — omitting `PRISM_SWEEP_REQUIRED=0` or
+> `PRISM_PO3_REQUIRED=0` activates the corresponding gate immediately. There
+> is no warning at startup; the runner will silently land in Stage 2 or
+> Stage 3 with all the gating engaged. Always set the full three-line block,
+> never the diff against the previous stage.
 
 Restart the runner. Every signal that fires now carries `signal.smart_money`
 populated with `ob`/`sweep`/`po3` sub-dicts and the Slack card includes the
@@ -112,7 +125,9 @@ numbers — but they're the failure flags:
 ### Stage 2 — sweep gate
 
 ```env
+PRISM_SMART_MONEY_ENABLED=1
 PRISM_SWEEP_REQUIRED=1
+PRISM_PO3_REQUIRED=0
 ```
 
 Restart. Now signals without a recent qualifying sweep are blocked at the
@@ -142,6 +157,8 @@ Do **not** advance until all of:
 ### Stage 3 — Po3 gate
 
 ```env
+PRISM_SMART_MONEY_ENABLED=1
+PRISM_SWEEP_REQUIRED=1
 PRISM_PO3_REQUIRED=1
 ```
 
@@ -200,14 +217,16 @@ want to back off one filter:
 
 ## 6. Open questions / future work
 
-- **Track A — `docs/PHASE_7A_SCOPE.md`**: scope doc for the ML feature
-  engineering retrain that consumes Stage 1 data. Five features available
-  pre-Phase-8: `htf_alignment`, `kill_zone_strength`, `sweep_confirmed`,
-  `ob_distance_pips`, `po3_phase`. Two more (`fvg_quality_score`, `ote_zone`)
-  deferred to Phase 7.B after Phase 8 lands.
+- ✅ **Track A — `docs/PHASE_7A_SCOPE.md`**: **merged at `4de59ee`** (PR #20).
+  Five buildable-now features (`htf_alignment`, `kill_zone_strength`,
+  `sweep_confirmed`, `ob_distance_pips`, `po3_phase`) specced; two
+  (`fvg_quality_score`, `ote_zone`) deferred to Phase 7.B after Phase 8 lands.
+  Read §4.3 of that doc before flipping Stage 1 — it's where the
+  `signal_audit.py` prerequisite called out in §2 above is justified.
 - **Track B — `prism/audit/smart_money_export.py`**: extract `smart_money`
   fields from the audit log into CSV/parquet so empirical distributions can
-  be plotted without hand-eyeballing Slack cards.
+  be plotted without hand-eyeballing Slack cards. Blocked on Phase 6.F
+  (`prism/delivery/signal_audit.py`) landing.
 - **Future — production metrics surface**: `gen.detector_failure_counts` is
   a primitive. Once Stage 1 has logged a few weeks, decide whether it earns
   a proper StatsD/Prometheus metric or stays as a logged scalar.
