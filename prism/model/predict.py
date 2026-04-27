@@ -2,9 +2,14 @@
 prism/model/predict.py
 PRISM Predictor — loads all 4 saved models and returns ensemble signal.
 """
+from __future__ import annotations
+
+import json
 import logging
+import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import joblib
 import numpy as np
@@ -15,6 +20,21 @@ logger = logging.getLogger(__name__)
 # Module-level path — intentionally a plain variable (not a constant) so tests can
 # monkey-patch MODEL_DIR to point at a temporary directory with tiny fixture models.
 MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
+
+#: Filename suffix for the per-instrument JSON sidecar that locks
+#: training-time configuration into the model artifact. Lives next to
+#: the joblibs at ``models/manifest_<instrument>.json``. Used to detect
+#: ``PRISM_OB_MAX_DISTANCE_PIPS`` drift between train and live —
+#: PHASE_7A_SCOPE.md §2.4 / §8.1.
+MANIFEST_FILENAME_TEMPLATE = "manifest_{instrument}.json"
+
+#: When ``True`` (env: ``PRISM_OB_MAX_DISTANCE_PIPS_STRICT=1``), a
+#: train/live mismatch on ``PRISM_OB_MAX_DISTANCE_PIPS`` raises at
+#: model load. Default ``False`` for the first deploy cycle so the
+#: warning is non-fatal — flip after one retrain has written a
+#: manifest, per scope §2.4.
+def _strict_ob_distance_pips() -> bool:
+    return os.environ.get("PRISM_OB_MAX_DISTANCE_PIPS_STRICT", "0") == "1"
 
 DIRECTION_RMAP = {0: -1, 1: 0, 2: 1}
 DIRECTION_STR = {-1: "SHORT", 0: "NEUTRAL", 1: "LONG"}
@@ -30,6 +50,115 @@ MODEL_LAYER_NAMES = (
     "layer2_magnitude",
     "layer3_confidence",
 )
+
+
+def manifest_path(instrument: str, model_dir: Optional[Path] = None) -> Path:
+    """Resolve the ``models/manifest_<instrument>.json`` path."""
+    base = Path(model_dir) if model_dir is not None else MODEL_DIR
+    return base / MANIFEST_FILENAME_TEMPLATE.format(instrument=instrument)
+
+
+def read_manifest(
+    instrument: str, model_dir: Optional[Path] = None,
+) -> Optional[dict]:
+    """Read the per-instrument model manifest.
+
+    Returns the parsed dict on success. ``None`` when the manifest
+    doesn't exist (legacy models pre-Phase-7A) or when JSON parsing
+    fails — the caller is responsible for deciding whether absence is
+    fatal.
+    """
+    path = manifest_path(instrument, model_dir)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Could not read manifest %s: %s — treating as missing", path, exc,
+        )
+        return None
+
+
+def write_manifest(
+    instrument: str,
+    *,
+    ob_max_distance_pips: float,
+    phase7a_features_active: bool = False,
+    extra: Optional[dict] = None,
+    model_dir: Optional[Path] = None,
+) -> Path:
+    """Write a per-instrument manifest sidecar at training time.
+
+    Locks the env-derived config that the model was trained against
+    so :func:`validate_manifest_against_env` can detect drift at
+    inference time. Idempotent — overwrites if present.
+    """
+    path = manifest_path(instrument, model_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "instrument": instrument,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "ob_max_distance_pips": float(ob_max_distance_pips),
+        "phase7a_features_active": bool(phase7a_features_active),
+    }
+    if extra:
+        # extra never overrides the canonical keys above
+        for k, v in extra.items():
+            if k not in payload:
+                payload[k] = v
+    path.write_text(json.dumps(payload, indent=2))
+    logger.info("Wrote model manifest → %s", path)
+    return path
+
+
+def validate_manifest_against_env(
+    manifest: Optional[dict], *, instrument: str,
+) -> Optional[str]:
+    """Compare the manifest's locked config to the live environment.
+
+    Returns ``None`` when no drift is detected. Returns a human-readable
+    message describing the drift otherwise. Caller decides whether to
+    log a warning or raise based on
+    :data:`PRISM_OB_MAX_DISTANCE_PIPS_STRICT`. Pre-Phase-7A models
+    that lack a manifest are silently allowed (no message) — this keeps
+    the rollout backward-compatible while operators retrain.
+    """
+    if manifest is None:
+        return None
+
+    locked_raw = manifest.get("ob_max_distance_pips")
+    if locked_raw is None:
+        return None
+    try:
+        locked = float(locked_raw)
+    except (TypeError, ValueError):
+        return (
+            f"manifest for {instrument} has malformed ob_max_distance_pips: "
+            f"{locked_raw!r}"
+        )
+
+    live_raw = os.environ.get("PRISM_OB_MAX_DISTANCE_PIPS", "30.0")
+    try:
+        live = float(live_raw)
+    except ValueError:
+        return (
+            f"PRISM_OB_MAX_DISTANCE_PIPS={live_raw!r} could not be parsed as float; "
+            f"manifest has {locked}"
+        )
+
+    # Float equality with a tolerance — env vars round-trip via str so
+    # exact equality is fine for typical configs (30, 30.0, 25.5), but
+    # a tiny tolerance shields against accumulator drift on exotic
+    # values an operator might paste with extra precision.
+    if abs(live - locked) > 1e-6:
+        return (
+            f"PRISM_OB_MAX_DISTANCE_PIPS drift for {instrument}: "
+            f"manifest locked {locked}, runtime env is {live}. "
+            "Retrain with the current env, or revert the env to the "
+            "trained value. PHASE_7A_SCOPE.md §2.4."
+        )
+    return None
 
 
 def missing_model_files(instruments, model_dir=None) -> list:
@@ -96,6 +225,23 @@ class PRISMPredictor:
         self._reg = _load("layer2_magnitude")
         self._clf_rf = _load("layer3_confidence")
         logger.info(f"[PRISMPredictor] All 4 models loaded for {self.instrument}")
+
+        # Phase 7.A sidecar lock-in: detect train/live env drift on
+        # ``PRISM_OB_MAX_DISTANCE_PIPS``. Warn-only by default — flip
+        # ``PRISM_OB_MAX_DISTANCE_PIPS_STRICT=1`` after the first
+        # retrain has written a manifest. PHASE_7A_SCOPE.md §2.4.
+        manifest = read_manifest(self.instrument)
+        self._manifest = manifest
+        drift_message = validate_manifest_against_env(
+            manifest, instrument=self.instrument,
+        )
+        if drift_message:
+            if _strict_ob_distance_pips():
+                raise RuntimeError(
+                    f"[PRISMPredictor] {drift_message} "
+                    "(PRISM_OB_MAX_DISTANCE_PIPS_STRICT=1)"
+                )
+            logger.warning("[PRISMPredictor] %s", drift_message)
 
     # ------------------------------------------------------------------
     # Prediction

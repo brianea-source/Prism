@@ -3,8 +3,11 @@ prism/data/pipeline.py
 PRISM Feature Engineering Pipeline.
 Builds the full feature matrix for ML training and inference.
 """
+from __future__ import annotations
+
 import logging
 from pathlib import Path
+from typing import Optional
 import numpy as np
 import pandas as pd
 
@@ -65,13 +68,40 @@ class PRISMFeaturePipeline:
         X_train, X_test, y_train, y_test = pipeline.train_test_split(df)
     """
 
-    def __init__(self, instrument: str, timeframe: str = "H1"):
+    def __init__(
+        self,
+        instrument: str,
+        timeframe: str = "H1",
+        *,
+        phase7a_sidecar_path: "Path | str | None" = None,
+        phase7a_ob_max_distance_pips: float | None = None,
+    ):
         self.instrument = instrument
         self.timeframe = timeframe
         self._scaler = None
         self._feature_cols: list[str] = []
         # Pip size for SL/TP calculations
         self.pip_size = 0.01 if any(x in instrument for x in ["XAU", "JPY"]) else 0.0001
+
+        # Phase 7.A: optional historical state sidecar (parquet) wired in via
+        # ``prism.data.historical_state.build_replay_sidecar``. When set, the
+        # training feature matrix gains the five Phase 7.A ICT columns merged
+        # by ``datetime``. Left as None on the live path — predict.py runs
+        # the engineer directly off ``signal.smart_money`` instead.
+        self.phase7a_sidecar_path: "Path | None" = (
+            Path(phase7a_sidecar_path) if phase7a_sidecar_path is not None else None
+        )
+        # ``ob_max_distance_pips`` is the lock-in surface — see
+        # docs/PHASE_7A_SCOPE.md §2.4 / §8.1. ``None`` means "skip the
+        # Phase 7.A enrichment" (legacy callers that don't know about
+        # the sidecar). Explicit value gets passed through to
+        # ``ICTFeatureEngineer`` and written into the model artifact
+        # sidecar by retrain.py.
+        self.phase7a_ob_max_distance_pips: float | None = (
+            float(phase7a_ob_max_distance_pips)
+            if phase7a_ob_max_distance_pips is not None
+            else None
+        )
 
     def build_features(self, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -229,8 +259,20 @@ class PRISMFeaturePipeline:
                     ) / self.pip_size
             df = df.dropna(subset=["direction_fwd_4"]).reset_index(drop=True)
 
+        # Phase 7.A: optional ICT feature enrichment via historical state
+        # sidecar. Joined by ``datetime`` to the technical feature matrix —
+        # see docs/PHASE_7A_SCOPE.md §4.1. Sidecar must be produced with the
+        # same timeframe as ``self.timeframe`` (typically H1) so the join
+        # keys line up; the helper warns and skips on count mismatch
+        # rather than silently merging on a partial overlap.
+        df = self._merge_phase7a_sidecar(df)
+
         exclude = {"datetime", "open", "high", "low", "close", "volume",
                    "direction_fwd_4", "magnitude_pips"}
+        # Phase 7.A's string label column is for gate-5 only, not for the
+        # ML feature matrix — splitters can't consume strings without an
+        # encoder, and the four one-hot booleans cover the same signal.
+        exclude.add("po3_phase")
         self._feature_cols = [c for c in df.columns if c not in exclude]
 
         logger.info(
@@ -239,6 +281,91 @@ class PRISMFeaturePipeline:
             " (no targets)" if not include_targets else "",
         )
         return df
+
+    def _merge_phase7a_sidecar(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Merge the Phase 7.A ICT feature columns into ``df`` if a
+        sidecar parquet path was supplied to ``__init__``. Idempotent —
+        no-op when the path is unset.
+
+        The merge is a left join on ``datetime`` against the sidecar's
+        ``audit_ts`` field, with each Phase 7.A column reduced to its
+        per-bar derivation via ``ICTFeatureEngineer.enrich``. Rows in
+        the technical frame that have no matching sidecar timestamp
+        retain the "no signal" sentinels documented in
+        :data:`prism.data.feature_engineering.PHASE_7A_FEATURE_COLUMNS`.
+        """
+        if self.phase7a_sidecar_path is None:
+            return df
+
+        try:
+            from prism.data.feature_engineering import (
+                ICTFeatureEngineer, PHASE_7A_FEATURE_COLUMNS,
+            )
+            from prism.data.historical_state import read_replay_sidecar
+        except Exception as exc:  # pragma: no cover — import-time failure path
+            logger.error(
+                "Phase 7.A sidecar requested but module imports failed: %s",
+                exc,
+            )
+            return df
+
+        sidecar_path = self.phase7a_sidecar_path
+        if not sidecar_path.exists():
+            logger.warning(
+                "Phase 7.A sidecar %s not found — skipping ICT enrichment",
+                sidecar_path,
+            )
+            return df
+
+        sidecar = read_replay_sidecar(sidecar_path)
+        threshold = self.phase7a_ob_max_distance_pips
+        if threshold is None:
+            engineer = ICTFeatureEngineer.from_env()
+        else:
+            engineer = ICTFeatureEngineer(ob_max_distance_pips=threshold)
+        enriched_sidecar = engineer.enrich(sidecar)
+
+        # Normalise both join keys to UTC-naive timestamps to avoid the
+        # tz-aware vs tz-naive comparison failure that would otherwise
+        # produce a fully empty merge silently.
+        merge_cols = ["datetime"] + list(PHASE_7A_FEATURE_COLUMNS)
+        sidecar_view = enriched_sidecar.copy()
+        sidecar_view["datetime"] = pd.to_datetime(
+            sidecar_view["audit_ts"], utc=True,
+        ).dt.tz_convert(None)
+        sidecar_view = sidecar_view[merge_cols]
+
+        df_join = df.copy()
+        df_join["datetime"] = pd.to_datetime(df_join["datetime"], utc=True).dt.tz_convert(None)
+        merged = df_join.merge(sidecar_view, on="datetime", how="left")
+
+        # Fill the "no sidecar match" sentinels per scope §2 so the model
+        # never sees raw NaNs in the ICT columns.
+        defaults = {
+            "htf_alignment": 1,
+            "kill_zone_strength": 0,
+            "sweep_confirmed": False,
+            "ob_distance_pips": -1.0,
+            "ob_in_range": False,
+            "po3_phase": "unknown",
+            "po3_accumulation": False,
+            "po3_manipulation": False,
+            "po3_distribution": False,
+            "po3_unknown": True,
+        }
+        for col, default in defaults.items():
+            if col in merged.columns:
+                merged[col] = merged[col].fillna(default)
+
+        join_count = (
+            merged[PHASE_7A_FEATURE_COLUMNS[0]].notna()
+            & (merged["po3_unknown"] != True)  # noqa: E712 — pandas mask
+        ).sum()
+        logger.info(
+            "Phase 7.A sidecar merged: %d / %d rows matched a sidecar timestamp",
+            join_count, len(merged),
+        )
+        return merged
 
     def _load_price_data(self, start_date: str, end_date: str) -> pd.DataFrame:
         """Try Tiingo first, fall back to yfinance."""
