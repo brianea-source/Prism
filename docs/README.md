@@ -37,6 +37,16 @@ These are the synthesis artifacts that fed PRD2. Read in this order if you want 
 
 ---
 
+## Phase Planning
+
+Forward-looking scope docs that lock the surface area of an upcoming phase before the implementation PR opens. Each one specifies inputs, outputs, acceptance gates, and deferred-work splits so the implementation review is a confirmation rather than a redesign.
+
+| Doc | Scope |
+|-----|-------|
+| [PHASE_7A_SCOPE.md](./PHASE_7A_SCOPE.md) | Pre-Phase-8 scope for the ML feature-engineering retrain. The 5 buildable-now ICT features, training-data path (historical reconstruction + Stage 1 validation), walk-forward harness spec, acceptance gates. |
+
+---
+
 ## Versioning convention
 
 - **PRD = v1.x** (Phases 0-4) — signal foundation, shipped, 360 tests green on `main`
