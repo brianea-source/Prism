@@ -12,6 +12,7 @@ Covers:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -238,6 +239,35 @@ class TestSummarize:
         assert result["confidence"]["min"] == pytest.approx(0.65)
         assert result["confidence"]["max"] == pytest.approx(0.83)
 
+    def test_summarize_coerces_object_typed_confidence(self):
+        """N3 — pd.to_numeric(errors='coerce') protects against malformed rows.
+
+        If a row sneaks through with confidence as a string (a real risk
+        when an upstream writer is buggy or a rogue line escapes
+        validate_record), the summary should NaN-out the bad value
+        rather than raise TypeError on .mean().
+        """
+        df = pd.DataFrame([
+            {**_record(signal_id="r1", confidence=0.7)},
+            {**_record(signal_id="r2", confidence=0.8)},
+            {**_record(signal_id="r3", confidence="garbage-string")},
+        ])
+        result = summarize(df)
+        # mean of [0.7, 0.8, NaN-dropped] = 0.75
+        assert result["confidence"]["mean"] == pytest.approx(0.75)
+        assert result["confidence"]["min"] == pytest.approx(0.7)
+        assert result["confidence"]["max"] == pytest.approx(0.8)
+
+    def test_summarize_returns_none_when_all_confidence_unparseable(self):
+        df = pd.DataFrame([
+            {**_record(signal_id="r1", confidence="bad-1")},
+            {**_record(signal_id="r2", confidence="bad-2")},
+        ])
+        result = summarize(df)
+        assert result["confidence"] is None
+        # Other counts still populated — coercion failure shouldn't gut summary
+        assert result["total_signals"] == 2
+
 
 # ---------------------------------------------------------------------------
 # Drift comparison machinery
@@ -342,6 +372,111 @@ class TestCompareFeature:
         )
         assert stringent["reject"] is False
 
+    # -------- PR #22 review B1: chi-squared degeneracy -----------------
+
+    def test_chi_squared_raises_on_all_same_historical(self):
+        """B1 — historical with all values in one bin → df=0 → degenerate.
+
+        With k=1 surviving bin, chisquare runs at df=0 and emits either
+        nan (silent false negative when stat ≈ 0) or 0/0 (always rejects).
+        We refuse the test instead.
+        """
+        live = pd.Series([0, 1, 2, 0, 1, 2])
+        hist = pd.Series([1] * 100)  # stuck detector — all in bin 1
+
+        with pytest.raises(ValueError, match=r"≥2 non-zero bins"):
+            compare_feature(live, hist, feature_type="int_ordinal")
+
+    def test_chi_squared_raises_on_all_same_historical_for_categorical(self):
+        live = pd.Series(["a", "b", "c", "a", "b"])
+        hist = pd.Series(["a"] * 50)
+
+        with pytest.raises(ValueError, match=r"≥2 non-zero bins"):
+            compare_feature(live, hist, feature_type="categorical")
+
+    def test_chi_squared_raises_when_historical_and_live_share_only_one_bin(self):
+        """Edge case: live and hist both observe bin 0, but only bin 0
+        has non-zero historical count. Even if live also has bin 1, the
+        mask=False bin gets dropped → 1 surviving bin → degenerate."""
+        live = pd.Series([0, 0, 0, 1, 1])
+        hist = pd.Series([0] * 100)
+
+        # Bin 1 is novel → gets warned/excluded; bin 0 is the only kept bin → df=0.
+        with pytest.raises(ValueError, match=r"≥2 non-zero bins"):
+            compare_feature(live, hist, feature_type="int_ordinal")
+
+    # -------- PR #22 review B2: novel live bins ------------------------
+
+    def test_chi_squared_warns_on_novel_live_bins_by_default(self, caplog):
+        """B2 — novel bins in live get silently excluded by the mask.
+
+        Default behaviour: log WARNING and proceed. The test still runs
+        on the surviving bins (biased low, but operator-visible).
+        """
+        rng = np.random.default_rng(seed=42)
+        live = pd.Series(np.concatenate([
+            rng.choice([0, 1, 2, 3], size=300),
+            np.full(50, 4),  # novel bin not in historical
+        ]))
+        hist = pd.Series(rng.choice([0, 1, 2, 3], size=2000))
+
+        with caplog.at_level("WARNING", logger="prism.audit.smart_money_export"):
+            result = compare_feature(live, hist, feature_type="int_ordinal")
+
+        # Test ran (didn't raise), warning emitted with bin info
+        assert "p_value" in result
+        warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("absent from historical" in m for m in warnings)
+        assert any("[4]" in m for m in warnings)
+
+    def test_chi_squared_strict_mode_raises_on_novel_live_bins(self):
+        live = pd.Series([0, 0, 0, 1, 1, 4, 4])  # 4 absent from historical
+        hist = pd.Series([0] * 50 + [1] * 50)
+
+        with pytest.raises(ValueError, match=r"absent from historical"):
+            compare_feature(
+                live, hist,
+                feature_type="int_ordinal",
+                strict_novel_bins=True,
+            )
+
+    def test_chi_squared_strict_mode_silent_when_no_novel_bins(self, caplog):
+        """Strict mode should be a no-op when historical covers live's range."""
+        rng = np.random.default_rng(seed=7)
+        live = pd.Series(rng.choice([0, 1, 2, 3], size=200))
+        hist = pd.Series(rng.choice([0, 1, 2, 3], size=2000))
+
+        with caplog.at_level("WARNING", logger="prism.audit.smart_money_export"):
+            result = compare_feature(
+                live, hist,
+                feature_type="int_ordinal",
+                strict_novel_bins=True,
+            )
+        assert "p_value" in result
+        assert not any(
+            "absent from historical" in r.message for r in caplog.records
+        )
+
+    def test_strict_novel_bins_kwarg_accepted_by_other_tests(self):
+        """The kwarg threads through dispatch uniformly. Fisher's exact
+        and KS accept-and-ignore it (no novel-bin failure mode applies)."""
+        rng = np.random.default_rng(seed=1)
+        live_bool = pd.Series(rng.random(200) < 0.3)
+        hist_bool = pd.Series(rng.random(500) < 0.3)
+        result_bool = compare_feature(
+            live_bool, hist_bool,
+            feature_type="bool", strict_novel_bins=True,
+        )
+        assert result_bool["test"] == "fishers_exact"
+
+        live_cont = pd.Series(rng.normal(size=200))
+        hist_cont = pd.Series(rng.normal(size=500))
+        result_cont = compare_feature(
+            live_cont, hist_cont,
+            feature_type="continuous", strict_novel_bins=True,
+        )
+        assert result_cont["test"] == "ks_two_sample"
+
 
 class TestCompareFeatures:
     """Multi-feature gate logic — Bonferroni + ≤1/N pass rule."""
@@ -414,6 +549,34 @@ class TestCompareFeatures:
         live, hist = self._matched_dfs()
         with pytest.raises(ValueError, match="non-empty"):
             compare_features(live, hist, [])
+
+    def test_strict_novel_bins_threads_through_to_chi_squared(self):
+        """B2 plumbing — compare_features → compare_feature → chi-squared."""
+        # Live has htf_alignment = 4 in some rows; historical does not.
+        rng = np.random.default_rng(seed=11)
+        live_df = pd.DataFrame({
+            "htf_alignment": np.concatenate([
+                rng.choice([0, 1, 2, 3], size=300), np.full(50, 4),
+            ]),
+            "sweep_confirmed": rng.random(350) < 0.3,
+            "ob_distance_pips": rng.normal(loc=15, scale=8, size=350),
+        })
+        hist_df = pd.DataFrame({
+            "htf_alignment": rng.choice([0, 1, 2, 3], size=2000),
+            "sweep_confirmed": rng.random(2000) < 0.3,
+            "ob_distance_pips": rng.normal(loc=15, scale=8, size=2000),
+        })
+        specs = [
+            ("htf_alignment", "int_ordinal"),
+            ("sweep_confirmed", "bool"),
+            ("ob_distance_pips", "continuous"),
+        ]
+
+        with pytest.raises(ValueError, match=r"absent from historical"):
+            compare_features(
+                live_df, hist_df, specs,
+                strict_novel_bins=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -495,12 +658,16 @@ class TestCLI:
         assert result["passed"] is False
 
     def test_feature_spec_parser_validates_type(self):
-        with pytest.raises(Exception, match="unknown feature type"):
+        with pytest.raises(argparse.ArgumentTypeError, match="unknown feature type"):
             _parse_feature_specs("htf_alignment:bogus")
 
     def test_feature_spec_parser_validates_format(self):
-        with pytest.raises(Exception, match="expected col:type"):
+        with pytest.raises(argparse.ArgumentTypeError, match="expected col:type"):
             _parse_feature_specs("htf_alignment")
+
+    def test_feature_spec_parser_validates_empty(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="non-empty"):
+            _parse_feature_specs("")
 
     def test_module_invocation_smoke(self, tmp_path):
         """python -m prism.audit.smart_money_export summary --state-dir <empty>
@@ -514,3 +681,27 @@ class TestCLI:
         )
         payload = json.loads(result.stdout)
         assert payload["total_signals"] == 0
+
+    def test_diff_strict_novel_bins_flag(self, tmp_path, capsys):
+        """B2 — CLI flag escalates the chi-squared novel-bin warning to
+        a hard failure. Caught by argparse → main → ValueError → non-zero
+        exit via the unhandled exception path."""
+        live_df = pd.DataFrame({
+            "x": [0, 0, 0, 1, 1, 1, 4, 4],  # bin 4 not in hist
+        })
+        hist_df = pd.DataFrame({
+            "x": [0] * 50 + [1] * 50,
+        })
+        live_path = tmp_path / "live.parquet"
+        hist_path = tmp_path / "hist.parquet"
+        live_df.to_parquet(live_path)
+        hist_df.to_parquet(hist_path)
+
+        with pytest.raises(ValueError, match=r"absent from historical"):
+            main([
+                "diff",
+                "--live", str(live_path),
+                "--historical", str(hist_path),
+                "--features", "x:int_ordinal",
+                "--strict-novel-bins",
+            ])
