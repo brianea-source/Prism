@@ -12,6 +12,7 @@ Flow:
 This module runs on every new M5/M15 bar.
 """
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -21,6 +22,10 @@ import pandas as pd
 from prism.signal.fvg import FVGDetector, FVGZone
 from prism.signal.icc import ICCDetector
 from prism.signal.htf_bias import HTFBiasEngine
+from prism.signal.order_blocks import OrderBlockDetector
+from prism.signal.po3 import Po3Detector
+from prism.signal.sweeps import SweepDetector
+from prism.delivery.session_filter import session_label
 from prism.news.intelligence import NewsIntelligence, NewsSignal
 from prism.execution.mt5_bridge import SignalPacket
 
@@ -28,6 +33,20 @@ logger = logging.getLogger(__name__)
 
 PIP_SIZE = {"XAUUSD": 0.01, "EURUSD": 0.0001, "GBPUSD": 0.0001, "USDJPY": 0.01}
 MIN_RR = 1.5
+
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip() not in ("", "0", "false", "False")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 class SignalGenerator:
@@ -42,6 +61,11 @@ class SignalGenerator:
         self.icc = ICCDetector()
         self.fvg = FVGDetector(instrument, "H4")
         self.htf_engine = HTFBiasEngine()
+        # Smart money detectors (Phase 6). Always instantiated so observability
+        # paths can populate the SignalPacket dict; gating is env-controlled.
+        self.ob_detector = OrderBlockDetector(instrument, "H4")
+        self.sweep_detector = SweepDetector(instrument)
+        self.po3_detector = Po3Detector(instrument)
         self._predictor = None
 
     def _load_predictor(self):
@@ -139,6 +163,19 @@ class SignalGenerator:
             logger.debug("Price not in active FVG zone with retest — no entry")
             return None
 
+        # --- Smart Money Layer (Phase 6.D) ---
+        smart_money = self._evaluate_smart_money(
+            h4_df=h4_df,
+            entry_df=entry_df,
+            current_price=current_price,
+            direction_str=direction_str,
+        )
+        if smart_money is not None and smart_money.get("blocked"):
+            logger.info(
+                f"Smart-money gate blocked: {smart_money.get('block_reason')}"
+            )
+            return None
+
         # --- Layer 4: SL/TP Calculation ---
         entry, sl, tp1, tp2, rr = self._calculate_levels(
             entry_df, direction_str, icc_signal, fvg_zone
@@ -179,8 +216,135 @@ class SignalGenerator:
                 "swing_seq_1h": [sp["type"] for sp in htf_result.swing_points_1h[-3:]],
                 "swing_seq_4h": [sp["type"] for sp in htf_result.swing_points_4h[-3:]],
             },
+            smart_money=(
+                {k: v for k, v in smart_money.items() if k not in ("blocked", "block_reason")}
+                if smart_money is not None
+                else None
+            ),
         )
         return packet
+
+    # ------------------------------------------------------------------
+    # Phase 6.D: smart-money confluence
+    # ------------------------------------------------------------------
+    def _evaluate_smart_money(
+        self,
+        h4_df: pd.DataFrame,
+        entry_df: pd.DataFrame,
+        current_price: float,
+        direction_str: str,
+    ) -> Optional[dict]:
+        """Run OB / Sweep / Po3 detectors and return a dict for ``SignalPacket.smart_money``.
+
+        Returns ``None`` when the master switch ``PRISM_SMART_MONEY_ENABLED`` is
+        off, so existing flows are unaffected. When enabled, the dict always has
+        ``ob``/``sweep``/``po3`` sub-dicts (or ``None`` for each missing piece) plus
+        ``blocked`` + ``block_reason`` for the caller to act on.
+        """
+        if not _env_bool("PRISM_SMART_MONEY_ENABLED", "0"):
+            return None
+
+        sweep_required = _env_bool("PRISM_SWEEP_REQUIRED", "1")
+        po3_required = _env_bool("PRISM_PO3_REQUIRED", "1")
+        min_disp_pips = _env_float("PRISM_MIN_DISPLACEMENT_PIPS", 10.0)
+        ob_max_dist_pips = _env_float("PRISM_OB_MAX_DISTANCE_PIPS", 30.0)
+
+        # --- Order Blocks (H4) -----------------------------------------
+        try:
+            self.ob_detector.detect(h4_df, min_displacement_pips=min_disp_pips)
+            self.ob_detector.update_states(h4_df)
+            nearest = self.ob_detector.get_nearest_ob(current_price, direction_str)
+            ob_distance = self.ob_detector.distance_to_ob(current_price, direction_str)
+        except Exception as exc:  # pragma: no cover — detectors must never crash signal gen
+            logger.warning(f"OrderBlockDetector failed: {exc}")
+            nearest = None
+            ob_distance = None
+
+        ob_dict: Optional[dict] = None
+        if nearest is not None:
+            ob_dict = {
+                "state": nearest.state.value,
+                "direction": nearest.direction,
+                "effective_direction": nearest.effective_direction,
+                "high": nearest.high,
+                "low": nearest.low,
+                "midpoint": nearest.midpoint,
+                "timeframe": nearest.timeframe,
+                "distance_pips": ob_distance,
+                "is_rejection_block": nearest.is_rejection_block,
+                "in_range": (
+                    ob_distance is not None and ob_distance <= ob_max_dist_pips
+                ),
+            }
+
+        # --- Liquidity Sweep (entry timeframe) -------------------------
+        try:
+            self.sweep_detector.detect(entry_df)
+            last_sweep = self.sweep_detector.last_sweep(direction_str)
+            has_recent = self.sweep_detector.has_recent_sweep(
+                direction_str, bars_back=5, require_displacement=True
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"SweepDetector failed: {exc}")
+            last_sweep = None
+            has_recent = False
+
+        sweep_dict: Optional[dict] = None
+        if last_sweep is not None:
+            anchor = (
+                self.sweep_detector._latest_scanned_bar
+                if self.sweep_detector._latest_scanned_bar is not None
+                else last_sweep.sweep_bar
+            )
+            sweep_dict = {
+                "type": last_sweep.type,
+                "swept_level": last_sweep.swept_level,
+                "sweep_bar": last_sweep.sweep_bar,
+                "bars_ago": int(anchor - last_sweep.sweep_bar),
+                "displacement_followed": last_sweep.displacement_followed,
+                "timestamp": last_sweep.timestamp,
+                "qualifies": has_recent,
+            }
+
+        # --- Po3 phase (entry timeframe, current session) --------------
+        session_str = session_label(datetime.now(timezone.utc))
+        try:
+            po3_state = self.po3_detector.detect_phase(entry_df, session=session_str)
+            is_entry_phase = self.po3_detector.is_entry_phase(po3_state)
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"Po3Detector failed: {exc}")
+            po3_state = None
+            is_entry_phase = False
+
+        po3_dict: Optional[dict] = None
+        if po3_state is not None:
+            po3_dict = {
+                "phase": po3_state.phase.value,
+                "session": po3_state.session,
+                "range_size_pips": po3_state.range_size_pips,
+                "sweep_detected": po3_state.sweep_detected,
+                "displacement_detected": po3_state.displacement_detected,
+                "is_entry_phase": is_entry_phase,
+            }
+
+        # --- Gating ----------------------------------------------------
+        blocked = False
+        block_reason = ""
+        if sweep_required and not has_recent:
+            blocked = True
+            block_reason = "no recent qualifying sweep for direction"
+        elif po3_required and not is_entry_phase:
+            blocked = True
+            phase_val = po3_dict["phase"] if po3_dict else "UNKNOWN"
+            block_reason = f"Po3 phase {phase_val} is not entry phase"
+
+        return {
+            "ob": ob_dict,
+            "sweep": sweep_dict,
+            "po3": po3_dict,
+            "blocked": blocked,
+            "block_reason": block_reason,
+        }
 
     def _calculate_levels(
         self,

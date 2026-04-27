@@ -146,6 +146,60 @@ class SlackNotifier:
                 f"  Alignment: {align_str}",
             ]
 
+        # Smart Money section (Phase 6.D) — OB / Sweep / Po3 confluence.
+        sm = getattr(signal, "smart_money", None) or {}
+        if sm:
+            sm_lines = ["", ":dart: *Smart Money*"]
+            ob = sm.get("ob") or None
+            sweep = sm.get("sweep") or None
+            po3 = sm.get("po3") or None
+
+            if ob:
+                kind = "RB" if ob.get("is_rejection_block") else "OB"
+                eff_dir = ob.get("effective_direction", ob.get("direction", "?"))
+                low = ob.get("low", 0.0)
+                high = ob.get("high", 0.0)
+                tf = ob.get("timeframe", "")
+                dist = ob.get("distance_pips")
+                in_range = ob.get("in_range")
+                dist_str = f" ({dist:.1f} pips away)" if isinstance(dist, (int, float)) else ""
+                in_range_emoji = (
+                    ":white_check_mark:" if in_range
+                    else ":small_orange_diamond:" if in_range is not None
+                    else ""
+                )
+                sm_lines.append(
+                    f"  {in_range_emoji} {kind} {eff_dir} {tf} {low:.5f}-{high:.5f}{dist_str}".rstrip()
+                )
+            else:
+                sm_lines.append("  :small_blue_diamond: OB: none in range")
+
+            if sweep:
+                stype = sweep.get("type", "?")
+                level = sweep.get("swept_level", 0.0)
+                bars_ago = sweep.get("bars_ago")
+                disp = sweep.get("displacement_followed", False)
+                qualifies = sweep.get("qualifies", False)
+                emoji = ":white_check_mark:" if qualifies else ":small_orange_diamond:"
+                bars_str = f" ({bars_ago} bars ago)" if bars_ago is not None else ""
+                disp_str = "" if disp else " — no displacement"
+                sm_lines.append(
+                    f"  {emoji} Sweep: {stype} @ {level:.5f}{bars_str}{disp_str}"
+                )
+            else:
+                sm_lines.append("  :small_blue_diamond: Sweep: none recent")
+
+            if po3:
+                phase = po3.get("phase", "UNKNOWN")
+                session = po3.get("session", "")
+                is_entry = po3.get("is_entry_phase", False)
+                emoji = ":white_check_mark:" if is_entry else ":small_orange_diamond:"
+                sm_lines.append(f"  {emoji} Po3: {phase} ({session})")
+            else:
+                sm_lines.append("  :small_blue_diamond: Po3: unknown")
+
+            body_lines += sm_lines
+
         # Show a short, human-scannable signal_id so Slack audit ↔ MT5 comment
         # ↔ server logs reconcile without copy-pasting a full UUID.
         short_id = (getattr(signal, "signal_id", "") or "")[:8] or "n/a"

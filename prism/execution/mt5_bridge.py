@@ -93,6 +93,16 @@ class SignalPacket:
     approximate_sizing: bool = False
     # HTF bias info (Phase 5) - dict with bias_1h, bias_4h, aligned, allowed_direction
     htf_bias: Optional[dict] = None
+    # Smart money confluence (Phase 6.D). Dict with three optional sub-dicts:
+    #   - ``ob``: nearest active OrderBlock {state, direction, high, low, midpoint,
+    #     timeframe, distance_pips, effective_direction} or None
+    #   - ``sweep``: most recent direction-matching LiquiditySweep
+    #     {type, swept_level, sweep_bar, bars_ago, displacement_followed} or None
+    #   - ``po3``: Po3State summary {phase, session, range_size_pips,
+    #     sweep_detected, displacement_detected, is_entry_phase} or None
+    # Populated only when ``PRISM_SMART_MONEY_ENABLED=1`` (default off until rollout
+    # confidence is established).
+    smart_money: Optional[dict] = None
 
 
 @dataclass
