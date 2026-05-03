@@ -131,3 +131,37 @@ Additional: Jason Graystone (5.1M views) — 3-step chart pattern system; Wysetr
 
 ### PRD2 vs Updated PRD — Recommendation:
 **PRD2.** Phase 1-4 are complete, tested, and merged to main. These new features represent an entirely new intelligence layer — transforming PRISM from a signal generator into a true smart money model. PRD2 starts clean, references Phase 1-4 as foundation, and owns the SMC/ICT upgrade arc.
+
+---
+
+## 5. "GOOD TRADING IN 2026" TECH STACK (TikTok source — Brian, 2026-05-03)
+
+Community-consensus tool stack for a modern retail trading setup:
+
+| Category | Tool Shown | Brian's Preference |
+|----------|-----------|-------------------|
+| Ideas | Claude (Anthropic) | ✅ Already core to PRISM |
+| Market Analysis | TradingView | ✅ Chart context source |
+| AI Analysis | Anthropic API | ✅ PRISM uses Claude via OpenClaw |
+| Backtesting | Lean/QuantConnect (fast-forward logo) | Candidate — replaces or augments current backtest layer |
+| Journal / Tracking | TradersSync / TradeZella (blue bull logo) | Candidate — Brian to confirm tool name |
+| Database / Organization | Notion (shown) | **GitHub preferred** — Issues, Projects, wiki |
+| Automation | Python | ✅ Core PRISM language |
+| Execution | MetaTrader 5 | ✅ Already integrated (MT5 bridge) |
+
+### Key Takeaway for PRISM
+- PRISM already covers 6/8 of the consensus stack (Claude, TradingView context, Anthropic API, Python, MT5, GitHub).
+- **Gap 1 — Backtesting:** Current backtest layer is ad-hoc (`prism/backtest/stockraft_analysis.py`). Should evaluate Lean/QuantConnect as a more rigorous backtesting engine, or formalize the current layer into a proper backtesting framework.
+- **Gap 2 — Journal/Tracking:** No structured trade journal yet. Consider GitHub Issues as the journal store (one Issue per trade, labels for outcome/instrument/phase, closed when trade exits). Keeps everything in GitHub per Brian's preference.
+- **Organization preference confirmed:** All docs, tracking, and project management → GitHub (Issues + Projects), NOT Notion.
+
+### GitHub-as-Journal Pattern (Proposed)
+```
+GitHub Issue per trade:
+  Title: [XAU/USD] Long @ 2318.50 — NY Open 2026-05-03
+  Labels: xauusd, long, ny-open, phase-7a
+  Body: Entry / SL / TP / Reasoning / Screenshot link
+  Close: with outcome (win/loss/BE) + actual R achieved
+→ Milestone = trading week
+→ Project board = signal pipeline view
+```
