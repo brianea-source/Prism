@@ -326,17 +326,17 @@ class TestModelPresenceCheck:
         """Only report the actually-missing files, not all 4 per instrument."""
         from prism.model.predict import missing_model_files
         (tmp_path / "layer1_xgb_EURUSD.joblib").write_bytes(b"x")
-        (tmp_path / "layer1_lgb_EURUSD.joblib").write_bytes(b"x")
+        (tmp_path / "layer1_lgbm_EURUSD.joblib").write_bytes(b"x")
         missing = missing_model_files(["EURUSD"], model_dir=tmp_path)
-        assert len(missing) == 2  # layer2_magnitude + layer3_confidence
+        assert len(missing) == 2  # layer2_reg + layer3_rf
         names = {p.stem for p in missing}
-        assert names == {"layer2_magnitude_EURUSD", "layer3_confidence_EURUSD"}
+        assert names == {"layer2_reg_EURUSD", "layer3_rf_EURUSD"}
 
     def test_layer_names_constant(self):
         """Guard against silent renames that would bypass the check."""
         from prism.model.predict import MODEL_LAYER_NAMES
         assert set(MODEL_LAYER_NAMES) == {
-            "layer1_xgb", "layer1_lgb", "layer2_magnitude", "layer3_confidence",
+            "layer1_xgb", "layer1_lgbm", "layer2_reg", "layer3_rf",
         }
 
 

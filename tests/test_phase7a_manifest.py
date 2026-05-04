@@ -212,9 +212,9 @@ def _train_fixture_models(model_dir: Path, instrument: str = "EURUSD") -> None:
     clf_rf.fit(X, y_mapped)
 
     joblib.dump(clf_xgb, model_dir / f"layer1_xgb_{instrument}.joblib")
-    joblib.dump(clf_lgb, model_dir / f"layer1_lgb_{instrument}.joblib")
-    joblib.dump(reg,     model_dir / f"layer2_magnitude_{instrument}.joblib")
-    joblib.dump(clf_rf,  model_dir / f"layer3_confidence_{instrument}.joblib")
+    joblib.dump(clf_lgb, model_dir / f"layer1_lgbm_{instrument}.joblib")
+    joblib.dump(reg,     model_dir / f"layer2_reg_{instrument}.joblib")
+    joblib.dump(clf_rf,  model_dir / f"layer3_rf_{instrument}.joblib")
 
 
 class TestPredictorManifestIntegration:
