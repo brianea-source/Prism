@@ -44,7 +44,7 @@ DEFAULT_WATCHDOG_LOG = "logs/watchdog.log"
 # Config
 # ---------------------------------------------------------------------------
 def _instruments() -> List[str]:
-    raw = os.environ.get("PRISM_INSTRUMENTS", "XAUUSD,EURUSD,GBPUSD")
+    raw = os.environ.get("PRISM_INSTRUMENTS", "XAUUSD,EURUSD")
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 

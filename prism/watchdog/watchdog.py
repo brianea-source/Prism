@@ -15,14 +15,17 @@ Design constraints:
   - **Idempotent restart logic**. If the runner is already healthy when
     we go to restart it, that's fine — ``schtasks /run`` is a no-op when
     the task is already running.
-  - **Cross-platform-ish**. Process detection uses ``psutil`` when
-    available so the same module can be unit-tested on macOS / Linux.
-    Restarts are Windows-only via ``schtasks``; the helpers shell out
-    so tests can patch ``subprocess.run``.
+  - **PID-file based detection**. The runner writes ``state/runner.pid``
+    on startup and removes it on clean shutdown. The watchdog reads this
+    PID and checks whether the process is alive via ``psutil.pid_exists``
+    (or ``os.kill(pid, 0)`` as fallback). This avoids false positives
+    from other Python processes (retrain, drift monitor, pip, etc.).
+  - **Cross-platform-ish**. Restarts are Windows-only via ``schtasks``;
+    the helpers shell out so tests can patch ``subprocess.run``.
 
 Configuration (env vars, all optional):
   - ``PRISM_WATCHDOG_TASK_NAME``     (default ``PRISM-Runner``)
-  - ``PRISM_WATCHDOG_PROCESS_NAME``  (default ``python.exe``)
+  - ``PRISM_STATE_DIR``              (default ``state`` — PID file lives here)
   - ``PRISM_WATCHDOG_CHECK_SEC``     (default ``300``)
   - ``PRISM_WATCHDOG_VERIFY_SEC``    (default ``15``)
   - ``PRISM_WATCHDOG_RETRY_SEC``     (default ``300``)
@@ -49,55 +52,60 @@ logger = logging.getLogger("prism.watchdog")
 # Defaults — kept module-level so tests can monkeypatch them.
 # ---------------------------------------------------------------------------
 DEFAULT_TASK_NAME = "PRISM-Runner"
-DEFAULT_PROCESS_NAME = "python.exe"
 DEFAULT_CHECK_SEC = 300        # 5 min between health checks
 DEFAULT_VERIFY_SEC = 15        # wait after schtasks /run before re-checking
 DEFAULT_RETRY_SEC = 300        # 5 min between restart attempts
 DEFAULT_MAX_ATTEMPTS = 3       # then escalate
 DEFAULT_LOG_PATH = "logs/watchdog.log"
+DEFAULT_PID_FILE = "state/runner.pid"
 
 
 # ---------------------------------------------------------------------------
-# Process detection
+# Process detection via PID file
 # ---------------------------------------------------------------------------
-def _runner_process_name() -> str:
-    return os.environ.get("PRISM_WATCHDOG_PROCESS_NAME", DEFAULT_PROCESS_NAME)
-
-
 def _runner_task_name() -> str:
     return os.environ.get("PRISM_WATCHDOG_TASK_NAME", DEFAULT_TASK_NAME)
 
 
-def runner_is_running(process_name: Optional[str] = None) -> bool:
-    """Return True when at least one matching process is alive.
+def _pid_file_path() -> Path:
+    state_dir = os.environ.get("PRISM_STATE_DIR", "state")
+    return Path(state_dir) / "runner.pid"
 
-    Uses ``psutil`` when available (cross-platform, easy to mock); falls
-    back to ``tasklist`` on Windows. Tests patch this directly.
-    """
-    name = (process_name or _runner_process_name()).lower()
+
+def _pid_is_alive(pid: int) -> bool:
+    """Check whether a process with the given PID exists."""
     try:
         import psutil  # type: ignore
-
-        for proc in psutil.process_iter(attrs=("name",)):
-            try:
-                if (proc.info.get("name") or "").lower() == name:
-                    return True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return False
+        return psutil.pid_exists(pid)
     except ImportError:
-        # psutil is the canonical path; fall back to tasklist on Windows.
-        try:
-            out = subprocess.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {name}"],
-                capture_output=True, text=True, timeout=15, check=False,
-            )
-            return name.lower() in (out.stdout or "").lower()
-        except (FileNotFoundError, subprocess.SubprocessError) as exc:
-            logger.error("Could not check runner liveness: %s", exc)
-            # Fail closed: if we can't tell, assume it's alive — better
-            # than spinning restart attempts on a misconfigured host.
-            return True
+        pass
+    # Fallback: os.kill with signal 0 probes without killing.
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
+def runner_is_running(pid_path: Optional[Path] = None) -> bool:
+    """Return True when the runner's PID file exists and the process is alive.
+
+    This is precise — unlike scanning for ``python.exe``, it won't
+    false-positive on retrain, drift monitor, pip, or any other Python
+    process running on the same host.
+    """
+    path = pid_path or _pid_file_path()
+    if not path.exists():
+        return False
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError) as exc:
+        logger.warning("Could not read PID file %s: %s", path, exc)
+        return False
+    alive = _pid_is_alive(pid)
+    if not alive:
+        logger.info("PID %d from %s is not alive — runner is down", pid, path)
+    return alive
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +187,6 @@ def _configure_logging(log_path: Optional[str] = None) -> Path:
 def attempt_restart(
     *,
     task_name: Optional[str] = None,
-    process_name: Optional[str] = None,
     verify_sec: Optional[int] = None,
     sleep_fn=time.sleep,
 ) -> bool:
@@ -188,7 +195,6 @@ def attempt_restart(
     Returns True if the runner is alive after the verification window.
     """
     task = task_name or _runner_task_name()
-    proc = process_name or _runner_process_name()
     wait = verify_sec if verify_sec is not None else int(
         os.environ.get("PRISM_WATCHDOG_VERIFY_SEC", DEFAULT_VERIFY_SEC)
     )
@@ -196,7 +202,7 @@ def attempt_restart(
     rc = schtasks_run(task)
     logger.info("schtasks /run /tn %s -> rc=%d; waiting %ds", task, rc, wait)
     sleep_fn(wait)
-    alive = runner_is_running(proc)
+    alive = runner_is_running()
     logger.info("post-restart check: runner alive=%s", alive)
     return alive
 
@@ -254,8 +260,8 @@ def run_forever(
     )
     log_path = _configure_logging()
     logger.info(
-        "Watchdog started — task=%s process=%s interval=%ds log=%s",
-        _runner_task_name(), _runner_process_name(), interval, log_path,
+        "Watchdog started — task=%s pid_file=%s interval=%ds log=%s",
+        _runner_task_name(), _pid_file_path(), interval, log_path,
     )
 
     iters = 0

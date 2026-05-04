@@ -4,7 +4,7 @@ The watchdog is a long-running supervisor that talks to ``schtasks`` and
 Slack. We mock both so the suite is portable and deterministic. Coverage:
 
   - schtasks_run delegates to subprocess and returns its rc
-  - runner_is_running honours psutil's view of the process table
+  - runner_is_running reads PID file and checks process liveness
   - attempt_restart triggers schtasks, sleeps, re-checks, returns alive bit
   - handle_runner_down counts attempts, sleeps between them, posts the
     correct Slack message on success vs. terminal failure
@@ -47,26 +47,34 @@ def test_schtasks_run_on_subprocess_error_returns_1():
 
 
 # ---------------------------------------------------------------------------
-# runner_is_running
+# runner_is_running — PID file based
 # ---------------------------------------------------------------------------
-def test_runner_is_running_finds_match_via_psutil():
-    fake_proc = MagicMock()
-    fake_proc.info = {"name": "python.exe"}
-    fake_psutil = MagicMock()
-    fake_psutil.process_iter.return_value = [fake_proc]
-    fake_psutil.NoSuchProcess = Exception
-    fake_psutil.AccessDenied = Exception
-    with patch.dict(sys.modules, {"psutil": fake_psutil}):
-        assert wd.runner_is_running("python.exe") is True
+def test_runner_is_running_true_when_pid_alive(tmp_path):
+    pid_file = tmp_path / "runner.pid"
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    with patch("prism.watchdog.watchdog._pid_is_alive", return_value=True):
+        assert wd.runner_is_running(pid_path=pid_file) is True
 
 
-def test_runner_is_running_returns_false_when_absent():
-    fake_psutil = MagicMock()
-    fake_psutil.process_iter.return_value = []
-    fake_psutil.NoSuchProcess = Exception
-    fake_psutil.AccessDenied = Exception
-    with patch.dict(sys.modules, {"psutil": fake_psutil}):
-        assert wd.runner_is_running("python.exe") is False
+def test_runner_is_running_false_when_pid_dead(tmp_path):
+    pid_file = tmp_path / "runner.pid"
+    pid_file.write_text("99999999", encoding="utf-8")
+    with patch("prism.watchdog.watchdog._pid_is_alive", return_value=False):
+        assert wd.runner_is_running(pid_path=pid_file) is False
+
+
+def test_runner_is_running_false_when_no_pid_file(tmp_path):
+    assert wd.runner_is_running(pid_path=tmp_path / "nonexistent.pid") is False
+
+
+def test_runner_is_running_false_when_pid_file_corrupt(tmp_path):
+    pid_file = tmp_path / "runner.pid"
+    pid_file.write_text("not-a-number", encoding="utf-8")
+    assert wd.runner_is_running(pid_path=pid_file) is False
+
+
+def test_pid_is_alive_for_current_process():
+    assert wd._pid_is_alive(os.getpid()) is True
 
 
 # ---------------------------------------------------------------------------
