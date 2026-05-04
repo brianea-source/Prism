@@ -77,7 +77,20 @@ class TiingoClient:
 
         if cache_file.exists():
             logger.info(f"Loading cached data: {cache_file}")
-            return pd.read_parquet(cache_file)
+            cached = pd.read_parquet(cache_file)
+            # Guard against legacy/poisoned caches that were written before
+            # the column-projection fix landed (datetime-only frames).
+            required = {"datetime", "open", "high", "low", "close"}
+            if required.issubset(cached.columns):
+                return cached
+            logger.warning(
+                "Cached parquet %s is missing %s — re-fetching from API",
+                cache_file, sorted(required - set(cached.columns)),
+            )
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
 
         try:
             if timeframe == "daily":
@@ -86,6 +99,13 @@ class TiingoClient:
                     {"startDate": start_date, "endDate": end_date, "format": "json"},
                 )
             else:
+                # NOTE: do NOT pass a ``columns`` query param to the IEX
+                # endpoint. When that param is set, Tiingo returns only the
+                # raw (non-``adj*``) column variants and the rename below
+                # silently drops every OHLCV field, leaving a ``datetime``-
+                # only DataFrame that gets cached and then blows up in
+                # _engineer_features with KeyError: \'close\'. Let Tiingo
+                # return the full row; we project to OHLCV ourselves.
                 freq_map = {"1hour": "1Hour", "4hour": "4Hour", "15min": "15Min", "5min": "5Min", "1min": "1Min"}
                 data = self._get(
                     f"iex/{ticker}/prices",
@@ -93,7 +113,6 @@ class TiingoClient:
                         "startDate": start_date,
                         "endDate": end_date,
                         "resampleFreq": freq_map.get(timeframe, "1Hour"),
-                        "columns": "open,high,low,close,volume",
                     },
                 )
 
@@ -102,12 +121,36 @@ class TiingoClient:
                 logger.warning(f"No data returned for {ticker}")
                 return df
 
-            # Select adjusted columns only to avoid duplicate column names
-            col_map = {"date": "datetime", "adjOpen": "open",
-                       "adjHigh": "high", "adjLow": "low",
-                       "adjClose": "close", "adjVolume": "volume"}
-            keep = [c for c in col_map if c in df.columns]
-            df = df[keep].rename(columns=col_map)
+            # Tiingo daily/prices returns ``adj*`` variants; iex/prices
+            # returns plain ``open``/``high``/``low``/``close``/``volume``.
+            # Accept either flavour, preferring ``adj*`` when both are
+            # present so split/dividend adjustments win on equity tickers.
+            rename: dict[str, str] = {"date": "datetime"}
+            for adj_src, plain_src, dst in [
+                ("adjOpen",   "open",   "open"),
+                ("adjHigh",   "high",   "high"),
+                ("adjLow",    "low",    "low"),
+                ("adjClose",  "close",  "close"),
+                ("adjVolume", "volume", "volume"),
+            ]:
+                if adj_src in df.columns:
+                    rename[adj_src] = dst
+                elif plain_src in df.columns:
+                    rename[plain_src] = dst
+            keep = [c for c in rename if c in df.columns]
+            df = df[keep].rename(columns=rename)
+            # Drop any duplicate-target columns the rename collapsed.
+            df = df.loc[:, ~df.columns.duplicated()]
+
+            required = {"datetime", "open", "high", "low", "close"}
+            missing = required - set(df.columns)
+            if missing:
+                # Don\'t cache a half-baked frame — that\'s exactly how the
+                # KeyError: \'close\' regression survived for months.
+                raise RuntimeError(
+                    f"Tiingo response for {ticker} missing required columns "
+                    f"{sorted(missing)}; got {list(df.columns)}"
+                )
 
             df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
             df = df.sort_values("datetime").reset_index(drop=True)

@@ -166,6 +166,21 @@ class PRISMFeaturePipeline:
         macro_end: str,
         include_targets: bool,
     ) -> pd.DataFrame:
+        # Normalise column names defensively. yfinance occasionally hands
+        # back capitalised columns (Open/High/...) or a MultiIndex with
+        # the ticker on the second level; Tiingo's IEX endpoint returns
+        # plain lowercase. Lower-casing here is idempotent and keeps the
+        # rest of the pipeline ignorant of upstream quirks.
+        df = df.rename(columns={c: c.lower() for c in df.columns if isinstance(c, str)})
+        required = {"datetime", "open", "high", "low", "close"}
+        missing = required - set(df.columns)
+        if missing:
+            raise KeyError(
+                f"_engineer_features({self.instrument}): price frame is missing "
+                f"{sorted(missing)}; got columns={list(df.columns)}. "
+                "This usually means the upstream cache parquet is corrupt "
+                "(datetime-only) — delete it under data/raw/ and retry."
+            )
         df = df.sort_values("datetime").reset_index(drop=True)
         close = df["close"]
 
@@ -245,7 +260,15 @@ class PRISMFeaturePipeline:
 
         # --- Target variables (training path only) ---
         if include_targets:
-            df["direction_fwd_4"] = np.sign(close.shift(-4) - close).astype(int)
+            # The last four rows can\'t see the forward bar so np.sign
+            # returns NaN; modern pandas refuses to cast NaN → int.
+            # Drop them now so the cast (and the magnitude loop below)
+            # only sees fully-defined target rows.
+            fwd = np.sign(close.shift(-4) - close)
+            df["direction_fwd_4"] = fwd
+            df = df.dropna(subset=["direction_fwd_4"]).reset_index(drop=True)
+            close = df["close"]
+            df["direction_fwd_4"] = df["direction_fwd_4"].astype(int)
             df["magnitude_pips"] = 0.0
             for i in range(len(df) - 20):
                 future = df.iloc[i + 1:i + 21]
@@ -257,8 +280,6 @@ class PRISMFeaturePipeline:
                     df.at[df.index[i], "magnitude_pips"] = (
                         close.iloc[i] - future["low"].min()
                     ) / self.pip_size
-            df = df.dropna(subset=["direction_fwd_4"]).reset_index(drop=True)
-
         # Phase 7.A: optional ICT feature enrichment via historical state
         # sidecar. Joined by ``datetime`` to the technical feature matrix —
         # see docs/PHASE_7A_SCOPE.md §4.1. Sidecar must be produced with the
@@ -370,7 +391,20 @@ class PRISMFeaturePipeline:
         return merged
 
     def _load_price_data(self, start_date: str, end_date: str) -> pd.DataFrame:
-        """Try Tiingo first, fall back to yfinance."""
+        """Resolve OHLCV bars in precedence order:
+
+        1. ``data/raw/<INSTRUMENT>_<TF>_*.parquet`` sidecars produced by
+           the dukascopy/yfinance/tiingo backfill scripts — these are
+           the canonical training inputs and already span 2021→today
+           with a clean OHLCV+source schema, so we trust them first.
+        2. Tiingo IEX/daily endpoint via :mod:`prism.data.tiingo`.
+        3. yfinance, with defensive column flattening (the API quietly
+           switched to a MultiIndex column layout in 2024).
+        """
+        sidecar = self._load_from_parquet_sidecar(start_date, end_date)
+        if sidecar is not None and not sidecar.empty:
+            return sidecar
+
         tf_map = {"H4": "4hour", "H1": "1hour", "M15": "15min", "D1": "daily"}
         tiingo_tf = tf_map.get(self.timeframe, "1hour")
 
@@ -390,15 +424,114 @@ class PRISMFeaturePipeline:
             raw = yf.download(ticker, start=start_date, end=end_date, interval=yf_tf, progress=False)
             if raw.empty:
                 return pd.DataFrame()
+            # yfinance >= 0.2.40 returns a MultiIndex on columns even for
+            # single-ticker downloads (level 0 = field, level 1 = ticker).
+            # Flatten it to the plain field name so our lower-case rename
+            # below produces the canonical OHLCV schema.
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
             raw = raw.reset_index()
-            raw.columns = [c.lower() for c in raw.columns]
-            raw = raw.rename(columns={"index": "datetime", "date": "datetime",
-                                       "datetime": "datetime"})
+            raw.columns = [str(c).lower() for c in raw.columns]
+            raw = raw.rename(columns={"index": "datetime", "date": "datetime"})
+            if "datetime" not in raw.columns:
+                # As a last resort, the index name may have come back blank.
+                raw = raw.rename(columns={raw.columns[0]: "datetime"})
             raw["datetime"] = pd.to_datetime(raw["datetime"])
-            return raw[["datetime", "open", "high", "low", "close"]].copy()
+            keep = [c for c in ["datetime", "open", "high", "low", "close", "volume"]
+                    if c in raw.columns]
+            return raw[keep].copy()
         except Exception as e:
             logger.error(f"yfinance also failed: {e}")
             return pd.DataFrame()
+
+    def _load_from_parquet_sidecar(
+        self, start_date: str, end_date: str,
+    ) -> "pd.DataFrame | None":
+        """Look for a pre-built ``data/raw/<INSTRUMENT>_<TF>_*.parquet``
+        sidecar that fully covers the requested date range. Prefer
+        the backfill-script outputs (``XAUUSD_H1_2021-01-01_2026-05-03.parquet``)
+        over the per-symbol Tiingo cache files — the former are
+        whole-history and pre-validated, the latter are narrow re-fetches
+        keyed on Tiingo ticker (``GLD``) rather than instrument symbol.
+        Returns None when no usable sidecar is found, so the caller can
+        fall through to the live API path.
+        """
+        cache_dir = Path("data/raw")
+        if not cache_dir.exists():
+            return None
+
+        # Prefer files explicitly tagged ``_tiingo_`` (their schema has
+        # the most history), then plain instrument-keyed files. We do a
+        # case-insensitive glob on the instrument prefix so tickers
+        # written upper- or lower-case both match.
+        patterns = [
+            f"{self.instrument}_{self.timeframe}_*tiingo*.parquet",
+            f"{self.instrument}_{self.timeframe}_*.parquet",
+        ]
+        seen: set[Path] = set()
+        candidates: list[Path] = []
+        for pat in patterns:
+            for path in sorted(cache_dir.glob(pat)):
+                if path in seen:
+                    continue
+                seen.add(path)
+                candidates.append(path)
+
+        if not candidates:
+            return None
+
+        try:
+            req_start = pd.Timestamp(start_date, tz="UTC")
+            req_end = pd.Timestamp(end_date, tz="UTC")
+        except Exception:
+            return None
+
+        for path in candidates:
+            try:
+                df = pd.read_parquet(path)
+            except Exception as exc:
+                logger.warning("Sidecar %s unreadable: %s", path, exc)
+                continue
+
+            required = {"datetime", "open", "high", "low", "close"}
+            missing = required - set(df.columns)
+            if missing:
+                logger.warning(
+                    "Sidecar %s missing %s — skipping",
+                    path, sorted(missing),
+                )
+                continue
+
+            dt = pd.to_datetime(df["datetime"], utc=True)
+            if dt.empty:
+                continue
+            # Allow a small slack at the start (training window may
+            # legitimately ask for dates before the sidecar's first bar
+            # if the underlying instrument is young); we only require
+            # that the sidecar reaches at least 30 days into the
+            # requested window, which is enough to build features.
+            if dt.max() < req_start or dt.min() > req_end:
+                logger.info(
+                    "Sidecar %s range [%s, %s] does not overlap [%s, %s]",
+                    path, dt.min(), dt.max(), req_start, req_end,
+                )
+                continue
+
+            mask = (dt >= req_start) & (dt <= req_end)
+            sliced = df.loc[mask].copy()
+            if sliced.empty:
+                continue
+            sliced["datetime"] = pd.to_datetime(sliced["datetime"], utc=True)
+            sliced = sliced.sort_values("datetime").reset_index(drop=True)
+            logger.info(
+                "Loaded %d bars from sidecar %s (range %s → %s)",
+                len(sliced), path, sliced["datetime"].min(), sliced["datetime"].max(),
+            )
+            keep = [c for c in ["datetime", "open", "high", "low", "close", "volume"]
+                    if c in sliced.columns]
+            return sliced[keep]
+
+        return None
 
     def normalize(self, df: pd.DataFrame, fit: bool = True) -> pd.DataFrame:
         """StandardScaler normalization per feature. Chronological fit only."""

@@ -145,7 +145,7 @@ class PRISMTrainer:
             if col in df.columns:
                 df[col] = df[col].fillna(0)
 
-        df = df.dropna(subset=["direction_4h", "magnitude_pips"]).reset_index(drop=True)
+        df = df.dropna(subset=["direction_fwd_4", "magnitude_pips"]).reset_index(drop=True)
 
         X_train_df, X_test_df, y_train_dir, y_test_dir = pipeline.split_train_test(df)
 
