@@ -39,3 +39,4 @@ models/*.json
 
 # PRISM runtime state (daily-brief guard, etc.)
 state/
+*.pdf

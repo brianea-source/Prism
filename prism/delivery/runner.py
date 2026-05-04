@@ -73,6 +73,23 @@ def _state_dir() -> Path:
     return Path(os.environ.get("PRISM_STATE_DIR", "state"))
 
 
+def _pid_file() -> Path:
+    return _state_dir() / "runner.pid"
+
+
+def _write_pid() -> None:
+    pf = _pid_file()
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    pf.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def _remove_pid() -> None:
+    try:
+        _pid_file().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _brief_state_file() -> Path:
     return _state_dir() / "last_brief_date.txt"
 
@@ -506,6 +523,8 @@ def run() -> None:
     signal_module.signal(signal_module.SIGTERM, _handle_sigterm)
     signal_module.signal(signal_module.SIGINT, _handle_sigterm)
 
+    _write_pid()
+
     # Read env at run() time, not import time, so test fixtures work correctly
     instruments = os.environ.get("PRISM_INSTRUMENTS", "XAUUSD,EURUSD,GBPUSD").split(",")
     scan_interval = int(os.environ.get("PRISM_SCAN_INTERVAL", "60"))
@@ -629,6 +648,7 @@ def run() -> None:
 
         time.sleep(scan_interval)
 
+    _remove_pid()
     logger.info("PRISM runner stopped")
 
 
