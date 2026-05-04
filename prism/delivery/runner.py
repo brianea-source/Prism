@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from prism.delivery.signal_audit import write_signal_audit
+from prism.journal import github_issues as _github_journal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -410,6 +411,19 @@ def _scan_instrument(
     # audit writer never raises — a broken audit log must not abort
     # delivery to Slack / MT5.
     write_signal_audit(signal, when=now)
+
+    # Phase 0.4: GitHub Issue trade journal. Gated by env so the default
+    # production path is unchanged until Brian opts in. Failures are
+    # swallowed inside the module — the runner cannot be taken down by
+    # GitHub being slow, expired tokens, or a corrupt journal_map.json.
+    if os.environ.get("PRISM_GITHUB_JOURNAL_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            _github_journal.on_signal_fired(signal)
+        except Exception as exc:  # noqa: BLE001 — defense in depth
+            logger.error(
+                "%s: github_journal hook raised (suppressed): %s",
+                instrument, exc, exc_info=True,
+            )
 
     # -- Delivery --
     ts = notifier.send_signal(
