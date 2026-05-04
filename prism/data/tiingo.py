@@ -26,6 +26,12 @@ INSTRUMENT_MAP = {
     "USDJPY": "USDJPY",
 }
 
+# Tickers that must be routed to Tiingo's /tiingo/fx/ endpoint.
+# IEX is US-equities only and returns 404 for forex pairs, which used to
+# fail silently as "No price data for EURUSD" during retraining.
+# XAUUSD intentionally stays on the equity GLD proxy (see INSTRUMENT_MAP).
+FOREX_TICKERS = {"EURUSD", "GBPUSD", "USDJPY"}
+
 
 # yfinance ticker overrides — used when Tiingo is unavailable.
 # These differ from INSTRUMENT_MAP because yfinance uses its own symbol conventions.
@@ -93,7 +99,25 @@ class TiingoClient:
                 pass
 
         try:
-            if timeframe == "daily":
+            freq_map = {"1hour": "1Hour", "4hour": "4Hour", "15min": "15Min", "5min": "5Min", "1min": "1Min"}
+            is_forex = ticker in FOREX_TICKERS
+
+            if is_forex:
+                # Forex pairs: route to /tiingo/fx/{ticker}/prices.
+                # IEX is US equities only and 404s for FX, which used to
+                # surface as "No price data for EURUSD" during retraining.
+                # The FX endpoint accepts the same resampleFreq tokens as
+                # IEX, plus 1Day for the daily-equivalent.
+                fx_freq = "1Day" if timeframe == "daily" else freq_map.get(timeframe, "1Hour")
+                data = self._get(
+                    f"tiingo/fx/{ticker}/prices",
+                    {
+                        "startDate": start_date,
+                        "endDate": end_date,
+                        "resampleFreq": fx_freq,
+                    },
+                )
+            elif timeframe == "daily":
                 data = self._get(
                     f"tiingo/daily/{ticker}/prices",
                     {"startDate": start_date, "endDate": end_date, "format": "json"},
@@ -106,7 +130,6 @@ class TiingoClient:
                 # only DataFrame that gets cached and then blows up in
                 # _engineer_features with KeyError: \'close\'. Let Tiingo
                 # return the full row; we project to OHLCV ourselves.
-                freq_map = {"1hour": "1Hour", "4hour": "4Hour", "15min": "15Min", "5min": "5Min", "1min": "1Min"}
                 data = self._get(
                     f"iex/{ticker}/prices",
                     {
@@ -141,6 +164,11 @@ class TiingoClient:
             df = df[keep].rename(columns=rename)
             # Drop any duplicate-target columns the rename collapsed.
             df = df.loc[:, ~df.columns.duplicated()]
+
+            # /tiingo/fx/ has no volume field — synthesize a zero column so
+            # downstream feature pipelines (which expect volume) don't blow up.
+            if "volume" not in df.columns:
+                df["volume"] = 0
 
             required = {"datetime", "open", "high", "low", "close"}
             missing = required - set(df.columns)
