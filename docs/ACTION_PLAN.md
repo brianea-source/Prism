@@ -312,6 +312,20 @@ Goals: Real capital, contained, with full kill-switch.
 **Effort:** Ongoing
 **Blocker:** None.
 
+### Task X.4: PRISM Self-Sufficiency
+**What:** Four-component infrastructure that runs PRISM without human supervision on the Windows VPS:
+
+- **VPS Watchdog** (`prism/watchdog/watchdog.py`) — polls `python.exe` every 5 min, restarts `PRISM-Runner` via `schtasks` with up to 3 attempts (5 min apart), Slack-alerts on success and on terminal failure. Logs to `logs/watchdog.log`. Scheduled task: `PRISM-Watchdog`.
+- **GitHub Webhook Auto-Deploy** (`scripts/deploy_webhook.py`) — Flask listener on `PRISM_DEPLOY_PORT` (default 9000). HMAC-validates `X-Hub-Signature-256` against `PRISM_DEPLOY_SECRET`, on push-to-main runs `git pull && pip install -r requirements.txt -q`, then `schtasks /end && /run` to bounce the runner. Scheduled task: `PRISM-DeployWebhook`.
+- **Drift Monitor + Auto-Retrain** (`prism/watchdog/drift_monitor.py`) — daily 03:00 UTC. Reads 7d of `state/signal_audit/<INST>/*.jsonl`. Trips if signals/day < `PRISM_DRIFT_MIN_SIGNALS` (3), %NEUTRAL > `PRISM_DRIFT_NEUTRAL_PCT` (0.60), or mean confidence < `PRISM_DRIFT_MIN_CONFIDENCE` (0.45). On trip → `python -m prism.model.retrain --instrument <INST>`, validates via `predict.missing_model_files`, restarts runner, Slack summary. Scheduled task: `PRISM-DriftMonitor`.
+- **Daily Digest** (`prism/watchdog/daily_digest.py`) — daily 08:00 UTC. Posts uptime %, signal counts, confidence distribution, last retrain per instrument, current execution mode. Scheduled task: `PRISM-DailyDigest`.
+
+**Why:** Independence goal — PRISM survives Brian being offline for a week. Watchdog catches OS-level crashes; auto-deploy means PRs land in production within a minute of merge; drift monitor self-heals model decay; daily digest makes status invisible (Slack tells you, you don't ask).
+**How:** Run `scripts/install_watchdog.bat` from an Administrator shell on the VPS after this PR merges. Configure GitHub webhook → `https://<vps>:9000/webhook` with the same `PRISM_DEPLOY_SECRET`.
+**Owner:** Ada (built)
+**Effort:** ~1 day total (built in this PR)
+**Blocker:** None.
+
 ---
 
 ## Sequencing diagram
