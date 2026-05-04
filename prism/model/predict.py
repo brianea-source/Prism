@@ -46,9 +46,9 @@ CONFIDENCE_LEVEL = {0: "LOW", 1: "MEDIUM", 2: "HIGH"}
 # loading the models into memory).
 MODEL_LAYER_NAMES = (
     "layer1_xgb",
-    "layer1_lgb",
-    "layer2_magnitude",
-    "layer3_confidence",
+    "layer1_lgbm",
+    "layer2_reg",
+    "layer3_rf",
 )
 
 
@@ -221,9 +221,9 @@ class PRISMPredictor:
             return joblib.load(path)
 
         self._clf_xgb = _load("layer1_xgb")
-        self._clf_lgb = _load("layer1_lgb")
-        self._reg = _load("layer2_magnitude")
-        self._clf_rf = _load("layer3_confidence")
+        self._clf_lgb = _load("layer1_lgbm")
+        self._reg = _load("layer2_reg")
+        self._clf_rf = _load("layer3_rf")
         logger.info(f"[PRISMPredictor] All 4 models loaded for {self.instrument}")
 
         # Phase 7.A sidecar lock-in: detect train/live env drift on
