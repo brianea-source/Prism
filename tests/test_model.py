@@ -266,6 +266,12 @@ def test_predict_returns_per_row_outputs():
         joblib.dump(reg,     mdir / "layer2_reg_EURUSD.joblib")
         joblib.dump(clf_rf,  mdir / "layer3_rf_EURUSD.joblib")
 
+        # Persist the feature-cols sidecar that PRISMPredictor now
+        # requires (fix/predict-feature-alignment). Use the trainer
+        # helper so this test exercises the same path retrain.py does.
+        from prism.model.train import write_feature_cols
+        write_feature_cols("EURUSD", list(X.columns), model_dir=mdir)
+
         # Patch MODEL_DIR before constructing the predictor
         import prism.model.predict as predict_mod
         original_dir = predict_mod.MODEL_DIR

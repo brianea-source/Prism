@@ -33,6 +33,49 @@ N_CV_SPLITS = 5
 DIRECTION_MAP = {-1: 0, 0: 1, 1: 2}          # model label space
 DIRECTION_RMAP = {0: -1, 1: 0, 2: 1}          # inverse
 
+#: Filename template for the per-instrument feature-columns sidecar that
+#: locks the trained feature schema (column names + order) into the
+#: model artifact. Lives next to the joblibs at
+#: ``models/feature_cols_<instrument>.json``. Consumed by
+#: :class:`prism.model.predict.PRISMPredictor` to project the live
+#: feature frame onto the trained schema, eliminating the
+#: ``Feature shape mismatch`` crash class once and for all.
+FEATURE_COLS_FILENAME_TEMPLATE = "feature_cols_{instrument}.json"
+
+
+def feature_cols_path(instrument: str, model_dir: "Path | None" = None) -> Path:
+    """Resolve the ``models/feature_cols_<instrument>.json`` path."""
+    base = Path(model_dir) if model_dir is not None else MODELS_DIR
+    return base / FEATURE_COLS_FILENAME_TEMPLATE.format(instrument=instrument)
+
+
+def write_feature_cols(
+    instrument: str,
+    feature_cols: list[str],
+    *,
+    model_dir: "Path | None" = None,
+) -> Path:
+    """Persist the ordered list of feature column names used at training
+    time. ``PRISMPredictor`` reads this back to project live feature
+    frames onto the trained schema (reorders columns, zero-fills any
+    drift, drops unexpected columns) before predict-time inference.
+
+    Idempotent: overwrites if present.
+    """
+    path = feature_cols_path(instrument, model_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "instrument": instrument,
+        "n_features": len(feature_cols),
+        "feature_cols": list(feature_cols),
+    }
+    path.write_text(json.dumps(payload, indent=2))
+    logger.info(
+        "Wrote feature_cols sidecar (%d columns) → %s",
+        len(feature_cols), path,
+    )
+    return path
+
 
 # ---------------------------------------------------------------------------
 # Dataclass
@@ -180,6 +223,12 @@ class PRISMTrainer:
         results.append(self._train_layer3_confidence(
             X_train, X_test, y_train_cls, y_test_cls, X_train_df, feature_cols
         ))
+
+        # ---- Persist the feature-column schema next to the joblibs.
+        # PRISMPredictor reads this back to project the live feature
+        # frame onto the trained schema, eliminating the
+        # "Feature shape mismatch" crash class.
+        write_feature_cols(self.instrument, feature_cols)
 
         # Report
         for r in results:

@@ -216,6 +216,16 @@ def _train_fixture_models(model_dir: Path, instrument: str = "EURUSD") -> None:
     joblib.dump(reg,     model_dir / f"layer2_reg_{instrument}.joblib")
     joblib.dump(clf_rf,  model_dir / f"layer3_rf_{instrument}.joblib")
 
+    # PRISMPredictor now also requires a feature_cols sidecar (see
+    # fix/predict-feature-alignment). Write a stub here so the
+    # manifest-integration tests below can still load the predictor.
+    from prism.model.train import write_feature_cols
+    write_feature_cols(
+        instrument,
+        [f"feat_{i}" for i in range(5)],
+        model_dir=model_dir,
+    )
+
 
 class TestPredictorManifestIntegration:
     """End-to-end coverage of how ``PRISMPredictor.__init__`` interacts

@@ -310,27 +310,34 @@ class TestModelPresenceCheck:
     def test_missing_returns_paths_for_untrained_instrument(self, tmp_path):
         from prism.model.predict import missing_model_files, MODEL_LAYER_NAMES
         missing = missing_model_files(["EURUSD", "XAUUSD"], model_dir=tmp_path)
-        # 4 layers × 2 instruments = 8 missing
-        assert len(missing) == 8
-        for p in missing:
-            assert p.suffix == ".joblib"
+        # 4 joblibs + 1 feature_cols sidecar per instrument × 2 instruments = 10
+        assert len(missing) == 10
+        for path in missing:
+            assert path.suffix == ".joblib" or path.name.startswith("feature_cols_")
 
     def test_present_returns_empty(self, tmp_path):
         from prism.model.predict import missing_model_files, MODEL_LAYER_NAMES
         for name in MODEL_LAYER_NAMES:
             (tmp_path / f"{name}_EURUSD.joblib").write_bytes(b"x")
+        # feature_cols sidecar is also required after fix/predict-feature-alignment
+        (tmp_path / "feature_cols_EURUSD.json").write_text("{}")
         missing = missing_model_files(["EURUSD"], model_dir=tmp_path)
         assert missing == []
 
     def test_partial_coverage(self, tmp_path):
-        """Only report the actually-missing files, not all 4 per instrument."""
+        """Only report the actually-missing files, not all artefacts per instrument."""
         from prism.model.predict import missing_model_files
         (tmp_path / "layer1_xgb_EURUSD.joblib").write_bytes(b"x")
         (tmp_path / "layer1_lgbm_EURUSD.joblib").write_bytes(b"x")
         missing = missing_model_files(["EURUSD"], model_dir=tmp_path)
-        assert len(missing) == 2  # layer2_reg + layer3_rf
-        names = {p.stem for p in missing}
-        assert names == {"layer2_reg_EURUSD", "layer3_rf_EURUSD"}
+        # layer2_reg + layer3_rf joblibs + feature_cols sidecar = 3 missing
+        assert len(missing) == 3
+        names = {p.stem if p.suffix == ".joblib" else p.name for p in missing}
+        assert names == {
+            "layer2_reg_EURUSD",
+            "layer3_rf_EURUSD",
+            "feature_cols_EURUSD.json",
+        }
 
     def test_layer_names_constant(self):
         """Guard against silent renames that would bypass the check."""
