@@ -119,11 +119,21 @@ def main() -> None:
     # walk-forward — so legacy retrains start producing manifests
     # the moment this PR ships.
     ob_max_dist_pips = float(os.environ.get("PRISM_OB_MAX_DISTANCE_PIPS", "30.0"))
+    # The feature_cols sidecar is written inside trainer.train_all_layers
+    # (see prism.model.train.write_feature_cols). Surface its path in the
+    # manifest so ops can audit the trained schema without grepping the
+    # joblibs directory by hand.
+    from prism.model.train import feature_cols_path as _fc_path
+    fc_sidecar = str(_fc_path(args.instrument))
     write_manifest(
         args.instrument,
         ob_max_distance_pips=ob_max_dist_pips,
         phase7a_features_active=bool(args.phase7a_sidecar),
-        extra={"retrain_report": out_path},
+        extra={
+            "retrain_report": out_path,
+            "feature_cols_sidecar": fc_sidecar,
+            "n_features": len(results[0].feature_importance) if results else 0,
+        },
     )
 
     if args.walkforward:
