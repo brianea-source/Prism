@@ -262,9 +262,9 @@ def test_predict_returns_per_row_outputs():
     with tempfile.TemporaryDirectory() as tmpdir:
         mdir = Path(tmpdir)
         joblib.dump(clf_xgb, mdir / "layer1_xgb_EURUSD.joblib")
-        joblib.dump(clf_lgb, mdir / "layer1_lgb_EURUSD.joblib")
-        joblib.dump(reg,     mdir / "layer2_magnitude_EURUSD.joblib")
-        joblib.dump(clf_rf,  mdir / "layer3_confidence_EURUSD.joblib")
+        joblib.dump(clf_lgb, mdir / "layer1_lgbm_EURUSD.joblib")
+        joblib.dump(reg,     mdir / "layer2_reg_EURUSD.joblib")
+        joblib.dump(clf_rf,  mdir / "layer3_rf_EURUSD.joblib")
 
         # Patch MODEL_DIR before constructing the predictor
         import prism.model.predict as predict_mod
