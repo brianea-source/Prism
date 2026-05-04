@@ -1,0 +1,124 @@
+name: Trade Journal Entry
+description: A PRISM-fired trade signal — instrument, direction, levels, and lifecycle.
+title: "[trade] <instrument> <direction> @ <entry>"
+labels: ["phase:pending"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        # PRISM Trade Journal
+
+        Auto-created by `prism.journal.github_issues.on_signal_fired`. Operators
+        can also file a manual entry — keep the fields aligned so the journal
+        reconciler doesn't choke on free-form input.
+
+  - type: dropdown
+    id: instrument
+    attributes:
+      label: Instrument
+      description: Symbol the signal fired on.
+      options:
+        - XAUUSD
+        - EURUSD
+        - GBPUSD
+    validations:
+      required: true
+
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Direction
+      options:
+        - LONG
+        - SHORT
+    validations:
+      required: true
+
+  - type: dropdown
+    id: session
+    attributes:
+      label: Session
+      description: Kill-zone the signal fired in.
+      options:
+        - London
+        - NY
+        - Asia
+    validations:
+      required: true
+
+  - type: input
+    id: entry
+    attributes:
+      label: Entry price
+      placeholder: "2345.20"
+    validations:
+      required: true
+
+  - type: input
+    id: sl
+    attributes:
+      label: Stop loss
+      placeholder: "2342.00"
+    validations:
+      required: true
+
+  - type: input
+    id: tp1
+    attributes:
+      label: Take profit 1
+      placeholder: "2348.40"
+    validations:
+      required: true
+
+  - type: input
+    id: tp2
+    attributes:
+      label: Take profit 2
+      placeholder: "2351.60"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Execution mode
+      options:
+        - NOTIFY
+        - CONFIRM
+        - AUTO
+    validations:
+      required: true
+
+  - type: dropdown
+    id: quality
+    attributes:
+      label: Setup quality
+      description: A = textbook, B = workable, C = marginal.
+      options:
+        - A
+        - B
+        - C
+    validations:
+      required: true
+
+  - type: input
+    id: signal_id
+    attributes:
+      label: Signal ID
+      description: PRISM-assigned UUID. Used by the journal reconciler to map fills, TP1 hits, and closes back to this issue.
+      placeholder: "00000000-0000-0000-0000-000000000000"
+    validations:
+      required: true
+
+  - type: textarea
+    id: narrative
+    attributes:
+      label: Signal narrative
+      description: HTF bias, smart-money confluence, and any free-form notes.
+      placeholder: |
+        - HTF bias: 4H bullish, 1H bullish, aligned ✅
+        - Order block: bullish OB at 2340.50 (12 pips away)
+        - Sweep: prior-session low at 2338.10 (3 bars ago, displacement followed)
+        - Po3: NY entry phase, 45-pip range
+        - Notes: ...
+      render: markdown
