@@ -215,7 +215,8 @@ def hours_since_last_signal(
 # ---------------------------------------------------------------------------
 # Data feed health
 # ---------------------------------------------------------------------------
-_FEED_HEALTH_TIMEOUT = int(os.environ.get("PRISM_FEED_HEALTH_TIMEOUT", "15"))
+def _feed_health_timeout() -> int:
+    return int(os.environ.get("PRISM_FEED_HEALTH_TIMEOUT", "15"))
 
 
 def _check_feed_health() -> Dict[str, str]:
@@ -235,7 +236,9 @@ def _check_feed_health() -> Dict[str, str]:
         if df is not None and not df.empty:
             results["CFTC COT"] = f"✅ OK ({len(df)} weeks)"
         else:
-            results["CFTC COT"] = "🚨 empty response"
+            # TODO: surface failure mode (unmapped symbol / network / parse)
+            # once quiver.py gains force_refresh and typed error returns.
+            results["CFTC COT"] = "🚨 empty/stale"
     except Exception as exc:
         results["CFTC COT"] = f"🚨 {type(exc).__name__}: {exc}"
 
@@ -247,7 +250,7 @@ def _check_feed_health() -> Dict[str, str]:
         if df is not None and not df.empty:
             results["CNN F&G"] = f"✅ OK ({len(df)} days)"
         else:
-            results["CNN F&G"] = "🚨 empty response"
+            results["CNN F&G"] = "🚨 empty/stale"
     except Exception as exc:
         results["CNN F&G"] = f"🚨 {type(exc).__name__}: {exc}"
 
@@ -261,7 +264,7 @@ def _check_feed_health() -> Dict[str, str]:
             resp = _req.get(
                 "https://api.tiingo.com/api/test",
                 headers={"Authorization": f"Token {tiingo_key}"},
-                timeout=_FEED_HEALTH_TIMEOUT,
+                timeout=_feed_health_timeout(),
             )
             if resp.ok:
                 results["Tiingo"] = "✅ OK"

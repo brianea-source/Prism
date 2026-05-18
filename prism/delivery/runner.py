@@ -97,7 +97,9 @@ def _brief_state_file() -> Path:
 # ---------------------------------------------------------------------------
 # Dormancy detection — "alive but not firing" alert
 # ---------------------------------------------------------------------------
-DORMANCY_THRESHOLD_HOURS = int(os.environ.get("PRISM_DORMANCY_THRESHOLD_HOURS", "48"))
+def _dormancy_threshold_hours() -> int:
+    return int(os.environ.get("PRISM_DORMANCY_THRESHOLD_HOURS", "48"))
+
 
 # _dormancy_alerted is intentionally NOT persisted. On runner restart it
 # resets to False, meaning the alert will fire again if the system is still
@@ -165,8 +167,9 @@ def _record_gate_rejection(gate_name: str) -> None:
 
 
 def _check_dormancy(notifier, now: datetime) -> None:
-    """Alert once if PRISM has been scanning kill zones for DORMANCY_THRESHOLD_HOURS
-    without firing a single signal. Resets when a signal fires."""
+    """Alert once if PRISM has been scanning kill zones without firing a
+    single signal for longer than PRISM_DORMANCY_THRESHOLD_HOURS (default 48).
+    Resets when a signal fires."""
     global _dormancy_alerted
     if _dormancy_alerted:
         return
@@ -175,8 +178,9 @@ def _check_dormancy(notifier, now: datetime) -> None:
     if last_fire is None:
         return
 
+    threshold = _dormancy_threshold_hours()
     hours_since = (now - last_fire).total_seconds() / 3600
-    if hours_since >= DORMANCY_THRESHOLD_HOURS:
+    if hours_since >= threshold:
         _dormancy_alerted = True
         top_gates = sorted(
             _gate_rejection_counts.items(), key=lambda x: x[1], reverse=True
