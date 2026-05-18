@@ -706,8 +706,12 @@ def run() -> None:
             "Rehydrated in-flight signal keys: %s", list(_last_signal_key.keys())
         )
 
+    # Seed last-signal-fire timestamp at startup so dormancy has a baseline
+    # if the runner has never fired under this state directory. ``now`` is
+    # read fresh here (not from the scan loop below) because this block
+    # runs once at runtime init, before the loop assigns ``now``.
     if _load_last_signal_fire() is None:
-        _save_last_signal_fire(now)
+        _save_last_signal_fire(datetime.now(timezone.utc))
 
     loaded_rejections = _load_gate_rejections()
     if loaded_rejections:
