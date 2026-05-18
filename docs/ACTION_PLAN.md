@@ -26,15 +26,13 @@ Repeat for EURUSD. Commit parquet outputs to git LFS or a separate data branch (
 **Effort:** 1 hour run-time + 1 hour to write the markdown report. Mostly waiting on Dukascopy downloads (~50 MB / instrument / year compressed).
 **Blocker:** None. Code is on this branch; just execute.
 
-### Task 0.2: Decide MT5-on-Mac path with Brian
-**What:** Brian picks one: (A) Cloud Windows VPS, (B) Wine on Mac, (C) Signal-only NOTIFY mode (interim).
-**Why:** Phase 7.A gate 6 doesn't need execution (NOTIFY-only A/B). But once gates pass and Brian wants live trades, the answer has to be ready. Decision now → no scramble in 2 weeks.
-**How:** One-line Slack reply to Ada: "VPS", "Wine", or "Notify-only for now". Recommended: VPS.
-**Owner:** Brian
-**Effort:** 5 minutes (decision). Implementation effort follows.
-**Blocker:** None. Information needed is in FULL_ANALYSIS.md §3.
+### Task 0.2: ~~Decide MT5-on-Mac path with Brian~~ ✅ DONE 2026-05-18
+**Decision:** Vultr Windows VPS at `209.250.248.171`. See [docs/decisions/DEC-001-mt5-execution-host.md](./decisions/DEC-001-mt5-execution-host.md).
+**How it went:** Brian confirmed "Lock vps" via Slack on 2026-05-18 07:56 CST. VPS was already provisioned and operational since 2026-05-04 (Task 0.3 was effectively done in parallel). Audit-log RCA on the same day independently validated host health.
+**Closes:** This task. Task 0.3 (provision VPS) marked complete.
+**Owner:** Brian (decision) + Ada (documentation in DEC-001).
 
-### Task 0.3: Provision Vultr Windows VPS (if 0.2 = VPS)
+### Task 0.3: ~~Provision Vultr Windows VPS (if 0.2 = VPS)~~ ✅ DONE 2026-05-04
 **What:** Spin up a Vultr Windows Server 2022 VPS (Frankfurt or London region, ~$13.50/mo), install MT5, log in to Exness, install Python 3.11, deploy PRISM as a Windows Service.
 **Why:** Eliminates Brian's Mac as the execution host. 24/7 uptime. Native MT5.
 **How:**
