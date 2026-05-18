@@ -172,6 +172,124 @@ def runner_uptime_pct(restarts: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Gate rejection stats (from runner)
+# ---------------------------------------------------------------------------
+def gate_rejection_stats(
+    *,
+    state_dir: Optional[Path] = None,
+) -> Dict[str, int]:
+    """Read the gate_rejections.json file written by the runner."""
+    path = (state_dir or _state_dir()) / "gate_rejections.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {k: int(v) for k, v in data.items() if isinstance(v, (int, float))}
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("digest: cannot read gate rejections: %s", exc)
+        return {}
+
+
+def hours_since_last_signal(
+    *,
+    state_dir: Optional[Path] = None,
+    now: Optional[datetime] = None,
+) -> Optional[int]:
+    """How many hours since the runner last fired a signal. None if no record."""
+    path = (state_dir or _state_dir()) / "last_signal_fire_ts.txt"
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        ts = datetime.fromisoformat(raw)
+        now = now or datetime.now(timezone.utc)
+        delta_h = (now - ts).total_seconds() / 3600
+        return int(delta_h)
+    except (OSError, ValueError) as exc:
+        logger.warning("digest: cannot read last_signal_fire_ts: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Data feed health
+# ---------------------------------------------------------------------------
+def _feed_health_timeout() -> int:
+    return int(os.environ.get("PRISM_FEED_HEALTH_TIMEOUT", "15"))
+
+
+def _check_feed_health() -> Dict[str, str]:
+    """Probe each external data feed using the same code paths the runner uses.
+
+    Calls the real fetch functions from prism.data so the health check
+    exercises the actual URLs, headers, and parsing logic — not a parallel
+    reimplementation that could drift.
+    """
+    results: Dict[str, str] = {}
+
+    # --- CFTC COT ---
+    try:
+        from prism.data.quiver import QuiverClient
+        client = QuiverClient()
+        df = client.get_cot_report("XAUUSD")
+        if df is not None and not df.empty:
+            results["CFTC COT"] = f"✅ OK ({len(df)} weeks)"
+        else:
+            # TODO: surface failure mode (unmapped symbol / network / parse)
+            # once quiver.py gains force_refresh and typed error returns.
+            results["CFTC COT"] = "🚨 empty/stale"
+    except Exception as exc:
+        results["CFTC COT"] = f"🚨 {type(exc).__name__}: {exc}"
+
+    # --- CNN Fear & Greed ---
+    try:
+        from prism.data.quiver import QuiverClient
+        client = QuiverClient()
+        df = client.get_fear_greed()
+        if df is not None and not df.empty:
+            results["CNN F&G"] = f"✅ OK ({len(df)} days)"
+        else:
+            results["CNN F&G"] = "🚨 empty/stale"
+    except Exception as exc:
+        results["CNN F&G"] = f"🚨 {type(exc).__name__}: {exc}"
+
+    # --- Tiingo ---
+    tiingo_key = os.environ.get("TIINGO_API_KEY", "")
+    if not tiingo_key:
+        results["Tiingo"] = "⚠️ no API key configured"
+    else:
+        try:
+            import requests as _req
+            resp = _req.get(
+                "https://api.tiingo.com/api/test",
+                headers={"Authorization": f"Token {tiingo_key}"},
+                timeout=_feed_health_timeout(),
+            )
+            if resp.ok:
+                results["Tiingo"] = "✅ OK"
+            else:
+                results["Tiingo"] = f"🚨 HTTP {resp.status_code}"
+        except Exception as exc:
+            results["Tiingo"] = f"🚨 {type(exc).__name__}"
+
+    # Append cache ages where applicable
+    _cache_paths = {
+        "CFTC COT": Path("data/raw/cot_XAUUSD.parquet"),
+        "CNN F&G": Path("data/raw/fear_greed.parquet"),
+    }
+    for name, cp in _cache_paths.items():
+        if name in results and cp.exists():
+            try:
+                age_h = (datetime.now(timezone.utc).timestamp() - cp.stat().st_mtime) / 3600
+                results[name] += f" (cache {int(age_h)}h old)"
+            except OSError:
+                pass
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Manifest / last-retrain lookup
 # ---------------------------------------------------------------------------
 def last_retrain_dates(
@@ -202,6 +320,26 @@ def last_retrain_dates(
 # ---------------------------------------------------------------------------
 # Message formatting
 # ---------------------------------------------------------------------------
+GATE_FRIENDLY_NAMES: Dict[str, str] = {
+    "news_blackout": "News blackout",
+    "news_bias": "News vs ML",
+    "news_bias_penalty": "News penalty",
+    "htf_bias": "HTF structure",
+    "icc_structure": "No ICC setup",
+    "icc_direction": "ICC ≠ direction",
+    "ml_confidence": "Low ML conf",
+    "no_features": "No features",
+    "fvg_entry": "No FVG entry",
+    "smart_money": "Smart money",
+    "rr_ratio": "Low R:R",
+    "unknown": "Unknown",
+}
+
+
+def _friendly_gate(gate: str) -> str:
+    return GATE_FRIENDLY_NAMES.get(gate, gate)
+
+
 @dataclass
 class DigestPayload:
     date: str
@@ -211,6 +349,9 @@ class DigestPayload:
     confidence: Counter
     last_retrain: Dict[str, Optional[str]]
     mode: str
+    gate_rejections: Dict[str, int]
+    feed_health: Dict[str, str]
+    hours_since_last_signal: Optional[int]
 
 
 def format_digest(payload: DigestPayload) -> str:
@@ -219,6 +360,12 @@ def format_digest(payload: DigestPayload) -> str:
     sig_parts = " | ".join(
         f"{inst}: {payload.signals.get(inst, 0)}" for inst in payload.signals
     ) or "(none)"
+
+    total_signals = sum(payload.signals.values())
+    if total_signals == 0:
+        sig_line = f"*Signals (24h):* 🚨 *ZERO* — {sig_parts}"
+    else:
+        sig_line = f"*Signals (24h):* {sig_parts}"
 
     conf_parts = " | ".join(
         f"{lvl}: {payload.confidence.get(lvl, 0)}"
@@ -229,14 +376,42 @@ def format_digest(payload: DigestPayload) -> str:
         f"{inst} {dt or 'never'}" for inst, dt in payload.last_retrain.items()
     ) or "(none)"
 
-    return (
-        f"📊 *PRISM Daily — {payload.date}*\n\n"
-        f"*Runner:* {uptime_emoji} Up {payload.uptime_pct}% ({payload.restarts} restarts)\n"
-        f"*Signals (24h):* {sig_parts}\n"
-        f"*Confidence:* {conf_parts}\n"
-        f"*Last retrain:* {retrain_parts}\n"
-        f"*Mode:* {payload.mode}"
-    )
+    lines = [
+        f"📊 *PRISM Daily — {payload.date}*\n",
+        f"*Runner:* {uptime_emoji} Up {payload.uptime_pct}% ({payload.restarts} restarts)",
+        sig_line,
+        f"*Confidence:* {conf_parts}",
+    ]
+
+    if payload.hours_since_last_signal is not None:
+        dormancy_emoji = "🚨" if payload.hours_since_last_signal >= 48 else (
+            "⚠️" if payload.hours_since_last_signal >= 24 else "✅"
+        )
+        lines.append(
+            f"*Last signal:* {dormancy_emoji} {payload.hours_since_last_signal}h ago"
+        )
+
+    if payload.gate_rejections:
+        sorted_gates = sorted(
+            payload.gate_rejections.items(), key=lambda x: x[1], reverse=True
+        )
+        total_rej = sum(v for _, v in sorted_gates)
+        gate_parts = " | ".join(
+            f"{_friendly_gate(k)}: {v}" for k, v in sorted_gates[:5]
+        )
+        lines.append(f"*Gate rejections:* {total_rej} total — {gate_parts}")
+
+    if payload.feed_health:
+        feed_parts = " | ".join(
+            f"{name}: {status}" for name, status in payload.feed_health.items()
+        )
+        any_bad = any(s != "✅ OK" for s in payload.feed_health.values())
+        lines.append(f"*Data feeds:* {'⚠️ ' if any_bad else ''}{feed_parts}")
+
+    lines.append(f"*Last retrain:* {retrain_parts}")
+    lines.append(f"*Mode:* {payload.mode}")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +465,7 @@ def build_payload(
     state_dir: Optional[Path] = None,
     models_dir: Optional[Path] = None,
     watchdog_log: Optional[Path] = None,
+    skip_feed_check: bool = False,
 ) -> DigestPayload:
     today = today or datetime.now(timezone.utc)
     insts = list(instruments or _instruments())
@@ -297,6 +473,9 @@ def build_payload(
     counts, conf = signals_and_confidence(insts, today=today, state_dir=state_dir)
     restarts = watchdog_restarts_in_window(log_path=watchdog_log, today=today)
     retrains = last_retrain_dates(insts, models_dir=models_dir)
+    rejections = gate_rejection_stats(state_dir=state_dir)
+    hours_dormant = hours_since_last_signal(state_dir=state_dir, now=today)
+    feeds = {} if skip_feed_check else _check_feed_health()
 
     return DigestPayload(
         date=today.strftime("%Y-%m-%d"),
@@ -306,6 +485,9 @@ def build_payload(
         confidence=conf,
         last_retrain=retrains,
         mode=_execution_mode(),
+        gate_rejections=rejections,
+        feed_health=feeds,
+        hours_since_last_signal=hours_dormant,
     )
 
 
@@ -314,9 +496,12 @@ def run_once(
     today: Optional[datetime] = None,
     instruments: Optional[Sequence[str]] = None,
     slack_fn=post_slack,
+    skip_feed_check: bool = False,
 ) -> str:
     _configure_logging()
-    payload = build_payload(today=today, instruments=instruments)
+    payload = build_payload(
+        today=today, instruments=instruments, skip_feed_check=skip_feed_check,
+    )
     msg = format_digest(payload)
     logger.info("digest payload: restarts=%d signals=%s mode=%s",
                 payload.restarts, dict(payload.signals), payload.mode)

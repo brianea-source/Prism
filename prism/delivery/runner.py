@@ -94,6 +94,112 @@ def _brief_state_file() -> Path:
     return _state_dir() / "last_brief_date.txt"
 
 
+# ---------------------------------------------------------------------------
+# Dormancy detection — "alive but not firing" alert
+# ---------------------------------------------------------------------------
+def _dormancy_threshold_hours() -> int:
+    return int(os.environ.get("PRISM_DORMANCY_THRESHOLD_HOURS", "48"))
+
+
+# _dormancy_alerted is intentionally NOT persisted. On runner restart it
+# resets to False, meaning the alert will fire again if the system is still
+# dormant. This is correct behavior: a restart is an operator action, and
+# they should get a fresh alert if dormancy persists.
+_dormancy_alerted = False
+
+_gate_rejection_counts: dict = {}
+
+
+def _rejection_stats_file() -> Path:
+    return _state_dir() / "gate_rejections.json"
+
+
+def _load_gate_rejections() -> dict:
+    """Hydrate gate rejection counts from disk on startup."""
+    path = _rejection_stats_file()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {k: int(v) for k, v in data.items() if isinstance(v, (int, float))}
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Could not load gate rejections from %s: %s", path, exc)
+        return {}
+
+
+def _last_signal_fire_file() -> Path:
+    return _state_dir() / "last_signal_fire_ts.txt"
+
+
+def _load_last_signal_fire() -> Optional[datetime]:
+    path = _last_signal_fire_file()
+    try:
+        if path.exists():
+            raw = path.read_text().strip()
+            if raw:
+                return datetime.fromisoformat(raw)
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not load last_signal_fire_ts: %s", exc)
+    return None
+
+
+def _save_last_signal_fire(ts: datetime) -> None:
+    path = _last_signal_fire_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(ts.isoformat())
+    except OSError as exc:
+        logger.warning("Could not persist last_signal_fire_ts: %s", exc)
+
+
+def _save_gate_rejections() -> None:
+    path = _rejection_stats_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_gate_rejection_counts, indent=2))
+    except OSError as exc:
+        logger.warning("Could not persist gate rejections: %s", exc)
+
+
+def _record_gate_rejection(gate_name: str) -> None:
+    """Increment a gate rejection counter. Persisted for the daily digest."""
+    _gate_rejection_counts[gate_name] = _gate_rejection_counts.get(gate_name, 0) + 1
+
+
+def _check_dormancy(notifier, now: datetime) -> None:
+    """Alert once if PRISM has been scanning kill zones without firing a
+    single signal for longer than PRISM_DORMANCY_THRESHOLD_HOURS (default 48).
+    Resets when a signal fires."""
+    global _dormancy_alerted
+    if _dormancy_alerted:
+        return
+
+    last_fire = _load_last_signal_fire()
+    if last_fire is None:
+        return
+
+    threshold = _dormancy_threshold_hours()
+    hours_since = (now - last_fire).total_seconds() / 3600
+    if hours_since >= threshold:
+        _dormancy_alerted = True
+        top_gates = sorted(
+            _gate_rejection_counts.items(), key=lambda x: x[1], reverse=True
+        )[:3]
+        gate_summary = ", ".join(f"{k}: {v}" for k, v in top_gates) if top_gates else "unknown"
+        notifier.send_alert(
+            f"⚠️ *PRISM dormancy alert* — no signals fired in "
+            f"{int(hours_since)}h of scanning.\n\n"
+            f"*Top gate rejections:* {gate_summary}\n\n"
+            f"Last signal: {last_fire.strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"Check runner.log for details. This may indicate a gate "
+            f"calibration issue or broken data feed."
+        )
+        logger.warning(
+            "Dormancy alert: %dh since last signal fire. Top rejections: %s",
+            int(hours_since), gate_summary,
+        )
+
+
 def _load_last_brief_date() -> Optional[date]:
     """Read the persisted last-brief date, if any. Silent on error."""
     path = _brief_state_file()
@@ -402,7 +508,10 @@ def _scan_instrument(
         return
 
     if signal is None:
-        logger.info("%s: No signal this scan", instrument)
+        gate = getattr(gen, "last_rejection_gate", None) or "unknown"
+        _record_gate_rejection(gate)
+        stats["scans_no_signal"] = stats.get("scans_no_signal", 0) + 1
+        logger.info("%s: No signal this scan (gate: %s)", instrument, gate)
         return
 
     if not _should_fire(instrument, signal, h4_df, now=now):
@@ -418,6 +527,9 @@ def _scan_instrument(
         getattr(signal, "signal_id", "n/a"),
     )
     stats["signals_fired"] = stats.get("signals_fired", 0) + 1
+    _save_last_signal_fire(now)
+    global _dormancy_alerted
+    _dormancy_alerted = False
 
     # Phase 6.F: structured per-signal audit. Wired after _should_fire so
     # the live audit log records exactly the "signal-producing bars"
@@ -594,6 +706,16 @@ def run() -> None:
             "Rehydrated in-flight signal keys: %s", list(_last_signal_key.keys())
         )
 
+    if _load_last_signal_fire() is None:
+        _save_last_signal_fire(now)
+
+    loaded_rejections = _load_gate_rejections()
+    if loaded_rejections:
+        _gate_rejection_counts.update(loaded_rejections)
+        logger.info(
+            "Rehydrated gate rejection counts: %s", loaded_rejections,
+        )
+
     logger.info(
         "PRISM runner started | instruments=%s | mode=%s | scan_interval=%ds | approvers=%s",
         instruments, execution_mode, scan_interval,
@@ -646,6 +768,8 @@ def run() -> None:
             except Exception as exc:
                 logger.error("Error scanning %s: %s", instrument, exc, exc_info=True)
 
+        _check_dormancy(notifier, now)
+        _save_gate_rejections()
         time.sleep(scan_interval)
 
     _remove_pid()
