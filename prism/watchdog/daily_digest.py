@@ -172,6 +172,96 @@ def runner_uptime_pct(restarts: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Gate rejection stats (from runner)
+# ---------------------------------------------------------------------------
+def gate_rejection_stats(
+    *,
+    state_dir: Optional[Path] = None,
+) -> Dict[str, int]:
+    """Read the gate_rejections.json file written by the runner."""
+    path = (state_dir or _state_dir()) / "gate_rejections.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {k: int(v) for k, v in data.items() if isinstance(v, (int, float))}
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("digest: cannot read gate rejections: %s", exc)
+        return {}
+
+
+def hours_since_last_signal(
+    *,
+    state_dir: Optional[Path] = None,
+    now: Optional[datetime] = None,
+) -> Optional[int]:
+    """How many hours since the runner last fired a signal. None if no record."""
+    path = (state_dir or _state_dir()) / "last_signal_fire_ts.txt"
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        ts = datetime.fromisoformat(raw)
+        now = now or datetime.now(timezone.utc)
+        delta_h = (now - ts).total_seconds() / 3600
+        return int(delta_h)
+    except (OSError, ValueError) as exc:
+        logger.warning("digest: cannot read last_signal_fire_ts: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Data feed health
+# ---------------------------------------------------------------------------
+def _check_feed_health() -> Dict[str, str]:
+    """Probe each external data feed and return a status string per feed.
+
+    This runs quick HTTP HEAD / GET checks with a short timeout. If a feed
+    has a local cache, we also report the cache age.
+    """
+    import urllib.request
+    import urllib.error
+
+    results: Dict[str, str] = {}
+    feeds = [
+        ("CFTC COT", "https://data.cdc.gov/resource/jr58-6ysp.json?$limit=1",
+         "prism/data/.cache_cot.json"),
+        ("CNN F&G", "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+         "prism/data/.cache_fng.json"),
+        ("Tiingo", "https://api.tiingo.com/iex/?tickers=SPY&token=__PROBE__",
+         None),
+    ]
+
+    for name, url, cache_path in feeds:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("User-Agent", "PRISM/1.0 health-check")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                code = resp.getcode()
+                if 200 <= code < 400:
+                    results[name] = "✅ OK"
+                else:
+                    results[name] = f"⚠️ HTTP {code}"
+        except urllib.error.HTTPError as exc:
+            results[name] = f"🚨 HTTP {exc.code}"
+        except Exception as exc:
+            results[name] = f"🚨 {type(exc).__name__}"
+
+        if cache_path:
+            cp = Path(cache_path)
+            if cp.exists():
+                try:
+                    age_h = (datetime.now(timezone.utc).timestamp() - cp.stat().st_mtime) / 3600
+                    results[name] += f" (cache {int(age_h)}h old)"
+                except OSError:
+                    pass
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Manifest / last-retrain lookup
 # ---------------------------------------------------------------------------
 def last_retrain_dates(
@@ -211,6 +301,9 @@ class DigestPayload:
     confidence: Counter
     last_retrain: Dict[str, Optional[str]]
     mode: str
+    gate_rejections: Dict[str, int]
+    feed_health: Dict[str, str]
+    hours_since_last_signal: Optional[int]
 
 
 def format_digest(payload: DigestPayload) -> str:
@@ -219,6 +312,12 @@ def format_digest(payload: DigestPayload) -> str:
     sig_parts = " | ".join(
         f"{inst}: {payload.signals.get(inst, 0)}" for inst in payload.signals
     ) or "(none)"
+
+    total_signals = sum(payload.signals.values())
+    if total_signals == 0:
+        sig_line = f"*Signals (24h):* 🚨 *ZERO* — {sig_parts}"
+    else:
+        sig_line = f"*Signals (24h):* {sig_parts}"
 
     conf_parts = " | ".join(
         f"{lvl}: {payload.confidence.get(lvl, 0)}"
@@ -229,14 +328,40 @@ def format_digest(payload: DigestPayload) -> str:
         f"{inst} {dt or 'never'}" for inst, dt in payload.last_retrain.items()
     ) or "(none)"
 
-    return (
-        f"📊 *PRISM Daily — {payload.date}*\n\n"
-        f"*Runner:* {uptime_emoji} Up {payload.uptime_pct}% ({payload.restarts} restarts)\n"
-        f"*Signals (24h):* {sig_parts}\n"
-        f"*Confidence:* {conf_parts}\n"
-        f"*Last retrain:* {retrain_parts}\n"
-        f"*Mode:* {payload.mode}"
-    )
+    lines = [
+        f"📊 *PRISM Daily — {payload.date}*\n",
+        f"*Runner:* {uptime_emoji} Up {payload.uptime_pct}% ({payload.restarts} restarts)",
+        sig_line,
+        f"*Confidence:* {conf_parts}",
+    ]
+
+    if payload.hours_since_last_signal is not None:
+        dormancy_emoji = "🚨" if payload.hours_since_last_signal >= 48 else (
+            "⚠️" if payload.hours_since_last_signal >= 24 else "✅"
+        )
+        lines.append(
+            f"*Last signal:* {dormancy_emoji} {payload.hours_since_last_signal}h ago"
+        )
+
+    if payload.gate_rejections:
+        sorted_gates = sorted(
+            payload.gate_rejections.items(), key=lambda x: x[1], reverse=True
+        )
+        total_rej = sum(v for _, v in sorted_gates)
+        gate_parts = " | ".join(f"{k}: {v}" for k, v in sorted_gates[:5])
+        lines.append(f"*Gate rejections:* {total_rej} total — {gate_parts}")
+
+    if payload.feed_health:
+        feed_parts = " | ".join(
+            f"{name}: {status}" for name, status in payload.feed_health.items()
+        )
+        any_bad = any(s != "✅ OK" for s in payload.feed_health.values())
+        lines.append(f"*Data feeds:* {'⚠️ ' if any_bad else ''}{feed_parts}")
+
+    lines.append(f"*Last retrain:* {retrain_parts}")
+    lines.append(f"*Mode:* {payload.mode}")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +415,7 @@ def build_payload(
     state_dir: Optional[Path] = None,
     models_dir: Optional[Path] = None,
     watchdog_log: Optional[Path] = None,
+    skip_feed_check: bool = False,
 ) -> DigestPayload:
     today = today or datetime.now(timezone.utc)
     insts = list(instruments or _instruments())
@@ -297,6 +423,9 @@ def build_payload(
     counts, conf = signals_and_confidence(insts, today=today, state_dir=state_dir)
     restarts = watchdog_restarts_in_window(log_path=watchdog_log, today=today)
     retrains = last_retrain_dates(insts, models_dir=models_dir)
+    rejections = gate_rejection_stats(state_dir=state_dir)
+    hours_dormant = hours_since_last_signal(state_dir=state_dir, now=today)
+    feeds = {} if skip_feed_check else _check_feed_health()
 
     return DigestPayload(
         date=today.strftime("%Y-%m-%d"),
@@ -306,6 +435,9 @@ def build_payload(
         confidence=conf,
         last_retrain=retrains,
         mode=_execution_mode(),
+        gate_rejections=rejections,
+        feed_health=feeds,
+        hours_since_last_signal=hours_dormant,
     )
 
 
@@ -314,9 +446,12 @@ def run_once(
     today: Optional[datetime] = None,
     instruments: Optional[Sequence[str]] = None,
     slack_fn=post_slack,
+    skip_feed_check: bool = False,
 ) -> str:
     _configure_logging()
-    payload = build_payload(today=today, instruments=instruments)
+    payload = build_payload(
+        today=today, instruments=instruments, skip_feed_check=skip_feed_check,
+    )
     msg = format_digest(payload)
     logger.info("digest payload: restarts=%d signals=%s mode=%s",
                 payload.restarts, dict(payload.signals), payload.mode)

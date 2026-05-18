@@ -75,6 +75,7 @@ class SignalGenerator:
             "ob": 0, "sweep": 0, "po3": 0,
         }
         self._predictor = None
+        self.last_rejection_gate: Optional[str] = None
 
     def _load_predictor(self):
         from prism.model.predict import PRISMPredictor
@@ -90,10 +91,13 @@ class SignalGenerator:
         Run all layers and return SignalPacket if conditions are met.
         Returns None if any layer blocks the trade.
         """
+        self.last_rejection_gate = None
+
         # --- Layer 0: News Intelligence ---
         news_signal = self.news.get_signal(self.instrument)
         blocked, reason = self.news.should_block_trade(news_signal)
         if blocked:
+            self.last_rejection_gate = "news_blackout"
             logger.info(f"Trade blocked by news: {reason}")
             return None
 
@@ -107,6 +111,7 @@ class SignalGenerator:
                          "direction_fwd_4", "magnitude_pips"]
         ]
         if not feature_cols:
+            self.last_rejection_gate = "no_features"
             logger.warning("No feature columns found in H4 data")
             return None
 
@@ -117,6 +122,7 @@ class SignalGenerator:
         direction_str = prediction["direction_str"]
 
         if direction_int == 0 or confidence < 0.60:
+            self.last_rejection_gate = "ml_confidence"
             logger.debug(f"Regime: {direction_str} confidence={confidence:.2f} — no trade")
             return None
 
@@ -124,6 +130,7 @@ class SignalGenerator:
         if news_signal.news_bias != "NEUTRAL":
             if (direction_str == "LONG" and news_signal.news_bias == "BEARISH") or \
                (direction_str == "SHORT" and news_signal.news_bias == "BULLISH"):
+                self.last_rejection_gate = "news_bias"
                 logger.info(
                     f"ML direction ({direction_str}) conflicts with news bias "
                     f"({news_signal.news_bias}) — skipping"
@@ -134,6 +141,7 @@ class SignalGenerator:
         htf_result = self.htf_engine.refresh(h1_df, h4_df)
         allowed, htf_reason = self.htf_engine.gate_signal(direction_str)
         if not allowed:
+            self.last_rejection_gate = "htf_bias"
             logger.info(f"HTF gate blocked: {htf_reason}")
             return None
 
@@ -141,6 +149,7 @@ class SignalGenerator:
         icc_signals = self.icc.detect_signals(h1_df)
         active_icc = [s for s in icc_signals if s.get("phase") == "CONTINUATION"]
         if not active_icc:
+            self.last_rejection_gate = "icc_structure"
             logger.debug("No ICC CONTINUATION phase active on H1")
             return None
 
@@ -148,6 +157,7 @@ class SignalGenerator:
 
         # ICC direction must agree with ML direction
         if icc_signal.get("direction") != direction_str:
+            self.last_rejection_gate = "icc_direction"
             logger.info(
                 f"ICC direction ({icc_signal.get('direction')}) disagrees with ML "
                 f"({direction_str}) — skipping"
@@ -160,7 +170,6 @@ class SignalGenerator:
             try:
                 self.fvg.save()
             except Exception as e:
-                # Persistence must never break signal generation.
                 logger.warning(f"FVG save failed: {e}")
         current_price = float(entry_df["close"].iloc[-1])
         fvg_zone = self.fvg.check_entry_trigger(
@@ -168,6 +177,7 @@ class SignalGenerator:
         )
 
         if fvg_zone is None:
+            self.last_rejection_gate = "fvg_entry"
             logger.debug("Price not in active FVG zone with retest — no entry")
             return None
 
@@ -179,6 +189,7 @@ class SignalGenerator:
             direction_str=direction_str,
         )
         if smart_money is not None and smart_money.get("blocked"):
+            self.last_rejection_gate = "smart_money"
             logger.info(
                 f"Smart-money gate blocked: {smart_money.get('block_reason')}"
             )
@@ -189,6 +200,7 @@ class SignalGenerator:
             entry_df, direction_str, icc_signal, fvg_zone
         )
         if rr < MIN_RR:
+            self.last_rejection_gate = "rr_ratio"
             logger.info(f"RR too low: {rr:.2f} < {MIN_RR} — no trade")
             return None
 

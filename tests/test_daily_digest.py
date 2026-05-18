@@ -137,6 +137,9 @@ def test_format_digest_matches_spec_format():
         confidence=__import__("collections").Counter({"HIGH": 1, "MEDIUM": 3, "LOW": 1}),
         last_retrain={"XAUUSD": "2026-05-04", "EURUSD": "2026-05-04"},
         mode="NOTIFY",
+        gate_rejections={},
+        feed_health={},
+        hours_since_last_signal=2,
     )
     msg = dd.format_digest(payload)
     assert "📊 *PRISM Daily — 2026-05-05*" in msg
@@ -157,11 +160,55 @@ def test_format_digest_degraded_uptime_emoji():
         confidence=Counter(),
         last_retrain={"XAUUSD": None},
         mode="NOTIFY",
+        gate_rejections={},
+        feed_health={},
+        hours_since_last_signal=None,
     )
     msg = dd.format_digest(payload)
     assert "🚨" in msg
     assert "Up 85%" in msg
     assert "XAUUSD never" in msg
+
+
+def test_format_digest_zero_signals_highlighted():
+    from collections import Counter
+    payload = dd.DigestPayload(
+        date="2026-05-18",
+        uptime_pct=100,
+        restarts=0,
+        signals={"XAUUSD": 0, "EURUSD": 0},
+        confidence=Counter(),
+        last_retrain={"XAUUSD": "2026-05-04"},
+        mode="NOTIFY",
+        gate_rejections={"news_bias": 412, "icc_structure": 98, "fvg_entry": 30},
+        feed_health={"CFTC COT": "🚨 HTTP 404", "CNN F&G": "✅ OK"},
+        hours_since_last_signal=336,
+    )
+    msg = dd.format_digest(payload)
+    assert "🚨 *ZERO*" in msg
+    assert "news_bias: 412" in msg
+    assert "Gate rejections:" in msg
+    assert "CFTC COT: 🚨 HTTP 404" in msg
+    assert "336h ago" in msg
+
+
+def test_format_digest_gate_rejections_sorted_by_count():
+    from collections import Counter
+    payload = dd.DigestPayload(
+        date="2026-05-18",
+        uptime_pct=100,
+        restarts=0,
+        signals={"XAUUSD": 1},
+        confidence=Counter({"HIGH": 1}),
+        last_retrain={"XAUUSD": "2026-05-04"},
+        mode="NOTIFY",
+        gate_rejections={"fvg_entry": 10, "news_bias": 200, "ml_confidence": 50},
+        feed_health={},
+        hours_since_last_signal=5,
+    )
+    msg = dd.format_digest(payload)
+    parts = msg.split("Gate rejections:")[1].split("\n")[0]
+    assert parts.index("news_bias") < parts.index("ml_confidence") < parts.index("fvg_entry")
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +240,7 @@ def test_build_payload_integrates_inputs(tmp_path, monkeypatch):
         state_dir=state_dir,
         models_dir=models_dir,
         watchdog_log=log_path,
+        skip_feed_check=True,
     )
     assert payload.signals == {"XAUUSD": 1}
     assert payload.confidence["HIGH"] == 1
@@ -200,6 +248,8 @@ def test_build_payload_integrates_inputs(tmp_path, monkeypatch):
     assert payload.restarts == 0
     assert payload.uptime_pct == 100
     assert payload.mode == "NOTIFY"
+    assert payload.gate_rejections == {}
+    assert payload.feed_health == {}
 
 
 def test_run_once_posts_to_slack(tmp_path, monkeypatch):
@@ -212,6 +262,83 @@ def test_run_once_posts_to_slack(tmp_path, monkeypatch):
     (tmp_path / "models").mkdir()
 
     slack = MagicMock(return_value=True)
-    msg = dd.run_once(today=today, slack_fn=slack)
+    msg = dd.run_once(today=today, slack_fn=slack, skip_feed_check=True)
     slack.assert_called_once()
     assert "PRISM Daily" in msg
+
+
+# ---------------------------------------------------------------------------
+# Gate rejection stats
+# ---------------------------------------------------------------------------
+def test_gate_rejection_stats_reads_json(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "gate_rejections.json").write_text(
+        json.dumps({"news_bias": 412, "icc_structure": 98}),
+        encoding="utf-8",
+    )
+    result = dd.gate_rejection_stats(state_dir=state)
+    assert result == {"news_bias": 412, "icc_structure": 98}
+
+
+def test_gate_rejection_stats_missing_file(tmp_path):
+    result = dd.gate_rejection_stats(state_dir=tmp_path)
+    assert result == {}
+
+
+def test_gate_rejection_stats_corrupt_json(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "gate_rejections.json").write_text("{bad", encoding="utf-8")
+    result = dd.gate_rejection_stats(state_dir=state)
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Hours since last signal
+# ---------------------------------------------------------------------------
+def test_hours_since_last_signal(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    fire_time = datetime(2026, 5, 16, 10, 0, tzinfo=timezone.utc)
+    (state / "last_signal_fire_ts.txt").write_text(
+        fire_time.isoformat(), encoding="utf-8",
+    )
+    now = datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc)
+    hours = dd.hours_since_last_signal(state_dir=state, now=now)
+    assert hours == 48
+
+
+def test_hours_since_last_signal_missing(tmp_path):
+    hours = dd.hours_since_last_signal(state_dir=tmp_path)
+    assert hours is None
+
+
+# ---------------------------------------------------------------------------
+# Build payload with gate rejections and dormancy
+# ---------------------------------------------------------------------------
+def test_build_payload_includes_rejections_and_dormancy(tmp_path, monkeypatch):
+    today = datetime(2026, 5, 18, 8, 0, tzinfo=timezone.utc)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+
+    (state_dir / "gate_rejections.json").write_text(
+        json.dumps({"news_bias": 100}), encoding="utf-8",
+    )
+    fire_time = datetime(2026, 5, 16, 8, 0, tzinfo=timezone.utc)
+    (state_dir / "last_signal_fire_ts.txt").write_text(
+        fire_time.isoformat(), encoding="utf-8",
+    )
+
+    monkeypatch.setenv("PRISM_EXECUTION_MODE", "NOTIFY")
+
+    payload = dd.build_payload(
+        today=today,
+        instruments=["XAUUSD"],
+        state_dir=state_dir,
+        models_dir=tmp_path / "models",
+        watchdog_log=tmp_path / "watchdog.log",
+        skip_feed_check=True,
+    )
+    assert payload.gate_rejections == {"news_bias": 100}
+    assert payload.hours_since_last_signal == 48
