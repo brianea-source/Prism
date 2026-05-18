@@ -90,7 +90,11 @@ def fetch_yfinance(instrument, timeframe, start, end):
     df = df[[c for c in ["datetime","open","high","low","close","volume"] if c in df.columns]]
     if timeframe == "H4":
         df = df.set_index("datetime").resample("4h").agg(
-            open="first", high="max", low="min", close="last", volume="sum"
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
         ).dropna().reset_index()
     df["source"] = "yfinance_fallback"
     log.warning(f"  ⚠️  Using yfinance fallback ({instrument} {timeframe}) — "
