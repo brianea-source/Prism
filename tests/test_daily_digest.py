@@ -186,7 +186,7 @@ def test_format_digest_zero_signals_highlighted():
     )
     msg = dd.format_digest(payload)
     assert "🚨 *ZERO*" in msg
-    assert "news_bias: 412" in msg
+    assert "News vs ML: 412" in msg
     assert "Gate rejections:" in msg
     assert "CFTC COT: 🚨 HTTP 404" in msg
     assert "336h ago" in msg
@@ -208,7 +208,7 @@ def test_format_digest_gate_rejections_sorted_by_count():
     )
     msg = dd.format_digest(payload)
     parts = msg.split("Gate rejections:")[1].split("\n")[0]
-    assert parts.index("news_bias") < parts.index("ml_confidence") < parts.index("fvg_entry")
+    assert parts.index("News vs ML") < parts.index("Low ML conf") < parts.index("No FVG entry")
 
 
 # ---------------------------------------------------------------------------

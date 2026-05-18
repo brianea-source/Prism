@@ -45,6 +45,25 @@ class TestGateRejection:
         data = json.loads(path.read_text())
         assert data["news_bias"] == 42
 
+    def test_load_gate_rejections_hydrates(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PRISM_STATE_DIR", str(tmp_path))
+        (tmp_path / "gate_rejections.json").write_text(
+            json.dumps({"htf_bias": 100, "news_bias": 50})
+        )
+        loaded = r._load_gate_rejections()
+        assert loaded == {"htf_bias": 100, "news_bias": 50}
+
+    def test_load_gate_rejections_missing_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PRISM_STATE_DIR", str(tmp_path))
+        loaded = r._load_gate_rejections()
+        assert loaded == {}
+
+    def test_load_gate_rejections_corrupt_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PRISM_STATE_DIR", str(tmp_path))
+        (tmp_path / "gate_rejections.json").write_text("{bad")
+        loaded = r._load_gate_rejections()
+        assert loaded == {}
+
 
 # ---------------------------------------------------------------------------
 # Last signal fire persistence
@@ -118,6 +137,24 @@ class TestDormancyCheck:
         now = datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc)
         r._check_dormancy(notifier, now)
         notifier.send_alert.assert_not_called()
+
+    def test_dormancy_resets_on_signal_fire(self, tmp_path, monkeypatch):
+        """After a dormancy alert fires, _dormancy_alerted should reset
+        to False when a signal fires (simulated by direct assignment)."""
+        monkeypatch.setenv("PRISM_STATE_DIR", str(tmp_path))
+        fire_time = datetime(2026, 5, 16, 8, 0, tzinfo=timezone.utc)
+        r._save_last_signal_fire(fire_time)
+
+        notifier = MagicMock()
+        now = datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc)
+        r._check_dormancy(notifier, now)
+        assert r._dormancy_alerted is True
+
+        r._dormancy_alerted = False
+        r._save_last_signal_fire(now)
+
+        r._check_dormancy(notifier, now)
+        assert notifier.send_alert.call_count == 1
 
 
 # ---------------------------------------------------------------------------

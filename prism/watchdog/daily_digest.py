@@ -215,48 +215,73 @@ def hours_since_last_signal(
 # ---------------------------------------------------------------------------
 # Data feed health
 # ---------------------------------------------------------------------------
+_FEED_HEALTH_TIMEOUT = int(os.environ.get("PRISM_FEED_HEALTH_TIMEOUT", "15"))
+
+
 def _check_feed_health() -> Dict[str, str]:
-    """Probe each external data feed and return a status string per feed.
+    """Probe each external data feed using the same code paths the runner uses.
 
-    This runs quick HTTP HEAD / GET checks with a short timeout. If a feed
-    has a local cache, we also report the cache age.
+    Calls the real fetch functions from prism.data so the health check
+    exercises the actual URLs, headers, and parsing logic — not a parallel
+    reimplementation that could drift.
     """
-    import urllib.request
-    import urllib.error
-
     results: Dict[str, str] = {}
-    feeds = [
-        ("CFTC COT", "https://data.cdc.gov/resource/jr58-6ysp.json?$limit=1",
-         "prism/data/.cache_cot.json"),
-        ("CNN F&G", "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-         "prism/data/.cache_fng.json"),
-        ("Tiingo", "https://api.tiingo.com/iex/?tickers=SPY&token=__PROBE__",
-         None),
-    ]
 
-    for name, url, cache_path in feeds:
+    # --- CFTC COT ---
+    try:
+        from prism.data.quiver import QuiverClient
+        client = QuiverClient()
+        df = client.get_cot_report("XAUUSD")
+        if df is not None and not df.empty:
+            results["CFTC COT"] = f"✅ OK ({len(df)} weeks)"
+        else:
+            results["CFTC COT"] = "🚨 empty response"
+    except Exception as exc:
+        results["CFTC COT"] = f"🚨 {type(exc).__name__}: {exc}"
+
+    # --- CNN Fear & Greed ---
+    try:
+        from prism.data.quiver import QuiverClient
+        client = QuiverClient()
+        df = client.get_fear_greed()
+        if df is not None and not df.empty:
+            results["CNN F&G"] = f"✅ OK ({len(df)} days)"
+        else:
+            results["CNN F&G"] = "🚨 empty response"
+    except Exception as exc:
+        results["CNN F&G"] = f"🚨 {type(exc).__name__}: {exc}"
+
+    # --- Tiingo ---
+    tiingo_key = os.environ.get("TIINGO_API_KEY", "")
+    if not tiingo_key:
+        results["Tiingo"] = "⚠️ no API key configured"
+    else:
         try:
-            req = urllib.request.Request(url, method="GET")
-            req.add_header("User-Agent", "PRISM/1.0 health-check")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                code = resp.getcode()
-                if 200 <= code < 400:
-                    results[name] = "✅ OK"
-                else:
-                    results[name] = f"⚠️ HTTP {code}"
-        except urllib.error.HTTPError as exc:
-            results[name] = f"🚨 HTTP {exc.code}"
+            import requests as _req
+            resp = _req.get(
+                "https://api.tiingo.com/api/test",
+                headers={"Authorization": f"Token {tiingo_key}"},
+                timeout=_FEED_HEALTH_TIMEOUT,
+            )
+            if resp.ok:
+                results["Tiingo"] = "✅ OK"
+            else:
+                results["Tiingo"] = f"🚨 HTTP {resp.status_code}"
         except Exception as exc:
-            results[name] = f"🚨 {type(exc).__name__}"
+            results["Tiingo"] = f"🚨 {type(exc).__name__}"
 
-        if cache_path:
-            cp = Path(cache_path)
-            if cp.exists():
-                try:
-                    age_h = (datetime.now(timezone.utc).timestamp() - cp.stat().st_mtime) / 3600
-                    results[name] += f" (cache {int(age_h)}h old)"
-                except OSError:
-                    pass
+    # Append cache ages where applicable
+    _cache_paths = {
+        "CFTC COT": Path("data/raw/cot_XAUUSD.parquet"),
+        "CNN F&G": Path("data/raw/fear_greed.parquet"),
+    }
+    for name, cp in _cache_paths.items():
+        if name in results and cp.exists():
+            try:
+                age_h = (datetime.now(timezone.utc).timestamp() - cp.stat().st_mtime) / 3600
+                results[name] += f" (cache {int(age_h)}h old)"
+            except OSError:
+                pass
 
     return results
 
@@ -292,6 +317,26 @@ def last_retrain_dates(
 # ---------------------------------------------------------------------------
 # Message formatting
 # ---------------------------------------------------------------------------
+GATE_FRIENDLY_NAMES: Dict[str, str] = {
+    "news_blackout": "News blackout",
+    "news_bias": "News vs ML",
+    "news_bias_penalty": "News penalty",
+    "htf_bias": "HTF structure",
+    "icc_structure": "No ICC setup",
+    "icc_direction": "ICC ≠ direction",
+    "ml_confidence": "Low ML conf",
+    "no_features": "No features",
+    "fvg_entry": "No FVG entry",
+    "smart_money": "Smart money",
+    "rr_ratio": "Low R:R",
+    "unknown": "Unknown",
+}
+
+
+def _friendly_gate(gate: str) -> str:
+    return GATE_FRIENDLY_NAMES.get(gate, gate)
+
+
 @dataclass
 class DigestPayload:
     date: str
@@ -348,7 +393,9 @@ def format_digest(payload: DigestPayload) -> str:
             payload.gate_rejections.items(), key=lambda x: x[1], reverse=True
         )
         total_rej = sum(v for _, v in sorted_gates)
-        gate_parts = " | ".join(f"{k}: {v}" for k, v in sorted_gates[:5])
+        gate_parts = " | ".join(
+            f"{_friendly_gate(k)}: {v}" for k, v in sorted_gates[:5]
+        )
         lines.append(f"*Gate rejections:* {total_rej} total — {gate_parts}")
 
     if payload.feed_health:

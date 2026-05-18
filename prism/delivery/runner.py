@@ -97,7 +97,12 @@ def _brief_state_file() -> Path:
 # ---------------------------------------------------------------------------
 # Dormancy detection — "alive but not firing" alert
 # ---------------------------------------------------------------------------
-DORMANCY_THRESHOLD_HOURS = 48
+DORMANCY_THRESHOLD_HOURS = int(os.environ.get("PRISM_DORMANCY_THRESHOLD_HOURS", "48"))
+
+# _dormancy_alerted is intentionally NOT persisted. On runner restart it
+# resets to False, meaning the alert will fire again if the system is still
+# dormant. This is correct behavior: a restart is an operator action, and
+# they should get a fresh alert if dormancy persists.
 _dormancy_alerted = False
 
 _gate_rejection_counts: dict = {}
@@ -105,6 +110,19 @@ _gate_rejection_counts: dict = {}
 
 def _rejection_stats_file() -> Path:
     return _state_dir() / "gate_rejections.json"
+
+
+def _load_gate_rejections() -> dict:
+    """Hydrate gate rejection counts from disk on startup."""
+    path = _rejection_stats_file()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {k: int(v) for k, v in data.items() if isinstance(v, (int, float))}
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Could not load gate rejections from %s: %s", path, exc)
+        return {}
 
 
 def _last_signal_fire_file() -> Path:
@@ -686,6 +704,13 @@ def run() -> None:
 
     if _load_last_signal_fire() is None:
         _save_last_signal_fire(now)
+
+    loaded_rejections = _load_gate_rejections()
+    if loaded_rejections:
+        _gate_rejection_counts.update(loaded_rejections)
+        logger.info(
+            "Rehydrated gate rejection counts: %s", loaded_rejections,
+        )
 
     logger.info(
         "PRISM runner started | instruments=%s | mode=%s | scan_interval=%ds | approvers=%s",
