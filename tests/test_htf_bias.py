@@ -553,14 +553,17 @@ class TestEnvironmentVariables:
 
 class TestGeneratorIntegration:
     def test_generator_htf_gate_blocks_signal(self):
-        """Mock htf_engine.gate_signal returns (False,...) -> generator returns None."""
+        """HTF not aligned -> generator returns None.
+
+        In structure-first mode the gate is via refresh().aligned /
+        .allowed_direction, not gate_signal(). In legacy mode the
+        gate_signal() path is used instead.
+        """
         from prism.signal.generator import SignalGenerator
 
-        # Create a generator with mocked dependencies
         with patch.object(SignalGenerator, '_load_predictor'):
             gen = SignalGenerator("XAUUSD", persist_fvg=False)
 
-        # Mock all the dependencies
         gen._predictor = MagicMock()
         gen._predictor.predict_latest.return_value = {
             "direction": 1,
@@ -576,12 +579,13 @@ class TestGeneratorIntegration:
         )
         gen.news.should_block_trade.return_value = (False, "")
 
-        # Mock HTF engine to block
         gen.htf_engine = MagicMock()
-        gen.htf_engine.refresh.return_value = MagicMock()
+        gen.htf_engine.refresh.return_value = MagicMock(
+            aligned=False, allowed_direction=None,
+            bias_1h=Bias.RANGING, bias_4h=Bias.RANGING,
+        )
         gen.htf_engine.gate_signal.return_value = (False, "HTF blocks LONG: bias is SHORT")
 
-        # Create test DataFrames
         h4_df = pd.DataFrame({
             "open": [100], "high": [102], "low": [99], "close": [101],
             "volume": [1000], "feature_1": [0.5]
@@ -596,18 +600,16 @@ class TestGeneratorIntegration:
 
         result = gen.generate(h4_df, h1_df, entry_df)
 
-        # Should return None because HTF gate blocked
         assert result is None
-        gen.htf_engine.gate_signal.assert_called_once_with("LONG")
+        gen.htf_engine.refresh.assert_called_once()
 
     def test_generator_htf_gate_allows_signal(self):
-        """Mock returns (True,...) -> generator continues to next layer."""
+        """HTF aligned -> generator continues to ICC layer."""
         from prism.signal.generator import SignalGenerator
 
         with patch.object(SignalGenerator, '_load_predictor'):
             gen = SignalGenerator("XAUUSD", persist_fvg=False)
 
-        # Mock predictor
         gen._predictor = MagicMock()
         gen._predictor.predict_latest.return_value = {
             "direction": 1,
@@ -617,26 +619,24 @@ class TestGeneratorIntegration:
             "magnitude_pips": 50,
         }
 
-        # Mock news
         gen.news = MagicMock()
         gen.news.get_signal.return_value = MagicMock(
             news_bias="NEUTRAL", risk_regime="RISK_ON"
         )
         gen.news.should_block_trade.return_value = (False, "")
 
-        # Mock HTF engine to ALLOW
         gen.htf_engine = MagicMock()
         gen.htf_engine.refresh.return_value = MagicMock(
             bias_1h=Bias.BULLISH,
             bias_4h=Bias.BULLISH,
             aligned=True,
-            allowed_direction="LONG"
+            allowed_direction="LONG",
+            swing_points_1h=[{"type": "HH"}, {"type": "HL"}],
+            swing_points_4h=[{"type": "HH"}, {"type": "HL"}],
         )
-        gen.htf_engine.gate_signal.return_value = (True, "HTF aligned")
 
-        # Mock ICC to block (so we can verify HTF passed)
         gen.icc = MagicMock()
-        gen.icc.detect_signals.return_value = []  # No ICC signals -> will return None
+        gen.icc.detect_signals.return_value = []
 
         h4_df = pd.DataFrame({
             "open": [100], "high": [102], "low": [99], "close": [101],
@@ -652,10 +652,8 @@ class TestGeneratorIntegration:
 
         result = gen.generate(h4_df, h1_df, entry_df)
 
-        # Should have passed HTF gate and called ICC
-        gen.htf_engine.gate_signal.assert_called_once_with("LONG")
+        gen.htf_engine.refresh.assert_called_once()
         gen.icc.detect_signals.assert_called_once()
-        # Result is None because ICC blocked, but HTF passed
         assert result is None
 
 
