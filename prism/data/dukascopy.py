@@ -14,12 +14,19 @@ URL: https://datafeed.dukascopy.com/datafeed/{INSTRUMENT}/{year}/{month:02d}/{da
      (month is 0-indexed on Dukascopy!)
 
 bi5 record struct (big-endian, 24 bytes each):
-  uint32  ms_from_midnight  - milliseconds from midnight UTC
+  uint32  s_from_midnight   - SECONDS from midnight UTC (M1 candle files;
+                              tick files use ms instead)
   uint32  open              - price * POINT_FACTOR
-  uint32  high              - price * POINT_FACTOR
-  uint32  low               - price * POINT_FACTOR
   uint32  close             - price * POINT_FACTOR
+  uint32  low               - price * POINT_FACTOR
+  uint32  high              - price * POINT_FACTOR
   float32 volume            - tick volume
+
+Field order is OCLH, NOT OHLC — verified empirically: chained
+close[i] ≡ open[i+1] and the OHLC consistency check (low ≤ open,close ≤ high)
+passes on 100% of records when fields are decoded in OCLH order, while
+100% of records fail when decoded as OHLC. Time base verified by the
+86,400/60 = 1440 record count per file at 60-second intervals.
 
 Data source spec from Stockraft PDF:
   "Dukascopy — Free historical tick data. Requires basic registration.
@@ -61,7 +68,8 @@ RESAMPLE_RULES: dict[str, str] = {
 
 DUKA_BASE   = "https://datafeed.dukascopy.com/datafeed"
 RECORD_SIZE = 24        # bytes per M1 bar
-RECORD_FMT  = ">IIIIIf"  # big-endian: 5×uint32 + float32
+# Big-endian: seconds_from_midnight (u32), open, close, low, high (u32 × 4), volume (f32)
+RECORD_FMT  = ">IIIIIf"
 WEEKEND_DAYS = {5, 6}   # Saturday=5, Sunday=6
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "data" / "dukascopy_cache"
@@ -106,7 +114,15 @@ def _fetch_day_raw(instrument: str, dt: datetime) -> Optional[bytes]:
 
 
 def _parse_bi5(raw: bytes, date: datetime, point_factor: float) -> pd.DataFrame:
-    """Decompress and parse one day's bi5 file into a DataFrame of M1 bars."""
+    """Decompress and parse one day's bi5 M1-candle file into a DataFrame.
+
+    Encoding (Dukascopy BID_candles_min_1.bi5):
+      - 24-byte records, big-endian.
+      - Field order is (time, open, close, low, high, volume) — NOT OHLC.
+      - Time is SECONDS from UTC midnight (not ms; ms is for tick files).
+      - Prices are integers scaled by point_factor.
+      - Volume is float32 (tick volume).
+    """
     try:
         data = lzma.decompress(raw)
     except Exception as e:
@@ -117,17 +133,19 @@ def _parse_bi5(raw: bytes, date: datetime, point_factor: float) -> pd.DataFrame:
     if n == 0:
         return pd.DataFrame()
 
-    midnight_ms = int(date.replace(
+    midnight = date.replace(
         hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
-    ).timestamp() * 1000)
+    )
+    midnight_s = int(midnight.timestamp())
 
     rows = []
     for i in range(n):
         chunk = data[i * RECORD_SIZE: (i + 1) * RECORD_SIZE]
         if len(chunk) < RECORD_SIZE:
             break
-        ms, o, h, l, c, vol = struct.unpack(RECORD_FMT, chunk)
-        ts = pd.Timestamp(midnight_ms + ms, unit="ms", tz="UTC")
+        # OCLH (NOT OHLC — Dukascopy quirk)
+        secs, o, c, l, h, vol = struct.unpack(RECORD_FMT, chunk)
+        ts = pd.Timestamp(midnight_s + secs, unit="s", tz="UTC")
         rows.append({
             "datetime": ts,
             "open":     o / point_factor,
@@ -149,7 +167,11 @@ def _resample_df(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     rule = RESAMPLE_RULES[timeframe]
     df2 = df.set_index("datetime")
     resampled = df2.resample(rule, label="left", closed="left").agg(
-        open="first", high="max", low="min", close="last", volume="sum"
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
     ).dropna().reset_index()
     return resampled
 
