@@ -29,7 +29,8 @@ from prism.signal.htf_bias import HTFBiasEngine
 from prism.signal.order_blocks import OrderBlockDetector
 from prism.signal.po3 import Po3Detector
 from prism.signal.sweeps import SweepDetector
-from prism.delivery.session_filter import session_label
+from prism.signal.quality_filter import apply_quality_filter
+from prism.delivery.session_filter import is_kill_zone, session_label
 from prism.news.intelligence import NewsIntelligence, NewsSignal
 from prism.execution.mt5_bridge import SignalPacket
 
@@ -264,6 +265,56 @@ class SignalGenerator:
         if rr < MIN_RR:
             self.last_rejection_gate = "rr_ratio"
             logger.info("RR too low: %.2f < %.1f — no trade", rr, MIN_RR)
+            return None
+
+        # --- Phase 8 Stage 1: Trade Quality Filter -------------------------
+        # Fail-soft, default-off via ``PRISM_QUALITY_FILTER_ENABLED``. When off
+        # the helper still computes the quality fields for observability and
+        # short-circuits to passed=True so live behavior is unchanged. When on
+        # it blocks the signal if any required check fails. Any unhandled
+        # exception is logged loud and treated as a pass to avoid breaking
+        # live flow during rollout.
+        try:
+            swing_high_20 = float(entry_df["high"].iloc[-20:].max())
+            swing_low_20 = float(entry_df["low"].iloc[-20:].min())
+            nearest_ob = (
+                self.ob_detector.get_nearest_ob(current_price, direction_str)
+                if getattr(self.ob_detector, "get_nearest_ob", None) is not None
+                else None
+            )
+            ob_list = [nearest_ob] if nearest_ob is not None else []
+            atr_val = (
+                float(entry_df["atr_14"].iloc[-1])
+                if "atr_14" in entry_df.columns
+                else 0.0
+            )
+            quality = apply_quality_filter(
+                fvg_zone=fvg_zone,
+                direction=direction_str,
+                entry_price=entry,
+                swing_high=swing_high_20,
+                swing_low=swing_low_20,
+                entry_df=entry_df,
+                ob_list=ob_list,
+                atr=atr_val,
+                kill_zone=is_kill_zone(),
+                # Stage 1: pass recent swing extremes as the candidate pool.
+                # Stage 2 will wire a richer swing-points feed once Task 1.2
+                # (FVGZone.formed_at) lands.
+                swing_points=[swing_high_20, swing_low_20],
+            )
+        except Exception as exc:
+            logger.error(
+                f"Quality filter raised for {self.instrument}: {exc}",
+                exc_info=True,
+            )
+            quality = None
+
+        if quality is not None and quality.enabled and not quality.passed:
+            logger.info(
+                f"Quality filter blocked {self.instrument} {direction_str}: "
+                f"{', '.join(quality.reasons)}"
+            )
             return None
 
         logger.info(
