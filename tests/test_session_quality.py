@@ -27,7 +27,7 @@ def _asian_range(range_pips=40.0):
     return AsianRange(
         high=3220.0, low=3200.0,
         midpoint=3210.0, range_pips=range_pips,
-        bar_count=72, date=date(2026, 5, 19),
+        bar_count=72, source_session="ASIAN", date=date(2026, 5, 19),
     )
 
 

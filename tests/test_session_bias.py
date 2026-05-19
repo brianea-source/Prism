@@ -9,6 +9,7 @@ from prism.signal.session_bias import (
     SessionBiasEngine,
     SessionPhase,
     AsianRange,
+    AccumulationRange,
     SessionBias,
 )
 
@@ -131,12 +132,14 @@ class TestSweepDetection:
     def _make_engine_with_range(self, ref: date, asian_high=3220.0, asian_low=3200.0):
         engine = SessionBiasEngine("XAUUSD")
         engine._today = ref
-        engine._asian_range = AsianRange(
+        engine._active_session = "LONDON"
+        engine._accum_range = AccumulationRange(
             high=asian_high,
             low=asian_low,
             midpoint=(asian_high + asian_low) / 2,
             range_pips=(asian_high - asian_low) / 0.01,
             bar_count=72,
+            source_session="ASIAN",
             date=ref,
         )
         return engine
@@ -215,9 +218,10 @@ class TestDisplacement:
 
         engine = SessionBiasEngine("XAUUSD")
         engine._today = ref
-        engine._asian_range = AsianRange(
+        engine._active_session = "LONDON"
+        engine._accum_range = AccumulationRange(
             high=3220.0, low=3200.0, midpoint=3210.0,
-            range_pips=2000.0, bar_count=72, date=ref,
+            range_pips=2000.0, bar_count=72, source_session="ASIAN", date=ref,
         )
 
         bars = [
@@ -243,9 +247,10 @@ class TestDisplacement:
 
         engine = SessionBiasEngine("XAUUSD")
         engine._today = ref
-        engine._asian_range = AsianRange(
+        engine._active_session = "LONDON"
+        engine._accum_range = AccumulationRange(
             high=3220.0, low=3200.0, midpoint=3210.0,
-            range_pips=2000.0, bar_count=72, date=ref,
+            range_pips=2000.0, bar_count=72, source_session="ASIAN", date=ref,
         )
 
         # Sweep bar: wick above 3220, close back inside.
@@ -320,3 +325,137 @@ class TestFullDailyCycle:
         assert bias.confidence_modifier == 1.0
         assert bias.asian_range is not None
         assert bias.asian_range.date == ref
+
+
+# ---------------------------------------------------------------------------
+# NY session — London range as accumulation
+# ---------------------------------------------------------------------------
+
+class TestNYSessionCycle:
+    """NY kill zone uses the London range (07:00–11:00 UTC) as accumulation."""
+
+    def test_ny_loads_london_range(self):
+        ref = date(2026, 5, 19)
+        engine = SessionBiasEngine("XAUUSD")
+
+        # Build London bars (07:00–11:00 UTC)
+        bars = []
+        for i in range(48):  # 48 M5 bars = 4 hours
+            total_min = 7 * 60 + i * 5
+            h, m = divmod(total_min, 60)
+            dt = datetime(ref.year, ref.month, ref.day, h, m, tzinfo=timezone.utc)
+            mid = 3250.0
+            price = mid + 15 * np.sin(2 * np.pi * i / 48)
+            bars.append({
+                "dt": dt,
+                "open": round(price - 0.5, 2),
+                "high": round(price + 1.5, 2),
+                "low": round(price - 1.5, 2),
+                "close": round(price + 0.3, 2),
+            })
+        df = _m5_bars(bars)
+
+        ar = engine.load_accumulation_range(df, ref_date=ref, force_session="NY")
+        assert ar is not None
+        assert ar.source_session == "LONDON"
+        assert ar.bar_count == 48
+
+    def test_ny_sweep_of_london_high_sets_short(self, monkeypatch):
+        monkeypatch.setenv("PRISM_SESSION_DISPLACEMENT_PIPS", "10")
+        ref = date(2026, 5, 19)
+        engine = SessionBiasEngine("XAUUSD")
+
+        # London range bars (07:00–11:00): range 3240–3260
+        london_bars = []
+        for i in range(48):
+            total_min = 7 * 60 + i * 5
+            h, m = divmod(total_min, 60)
+            dt = datetime(ref.year, ref.month, ref.day, h, m, tzinfo=timezone.utc)
+            mid = 3250.0
+            price = mid + 10 * np.sin(2 * np.pi * i / 48)
+            london_bars.append({
+                "dt": dt,
+                "open": round(price - 0.5, 2),
+                "high": round(price + 1.0, 2),
+                "low": round(price - 1.0, 2),
+                "close": round(price + 0.3, 2),
+            })
+
+        engine.load_accumulation_range(_m5_bars(london_bars), ref_date=ref,
+                                       force_session="NY")
+        ar = engine.accumulation_range
+        assert ar is not None
+
+        # NY bars that sweep the London high then reverse
+        ny_bars = london_bars + [
+            {"dt": datetime(2026, 5, 19, 13, 30, tzinfo=timezone.utc),
+             "open": ar.high - 1.0, "high": ar.high + 5.0,
+             "low": ar.high - 2.0, "close": ar.high - 1.5},
+            {"dt": datetime(2026, 5, 19, 13, 35, tzinfo=timezone.utc),
+             "open": ar.high - 1.5, "high": ar.high - 1.0,
+             "low": ar.high - 7.0, "close": ar.high - 6.0},
+        ]
+        bias = engine.update(_m5_bars(ny_bars))
+
+        assert bias.sweep_confirmed is True
+        assert bias.sweep_side == "HIGH"
+        assert bias.direction == "SHORT"
+        assert bias.displacement_confirmed is True
+        assert bias.phase == SessionPhase.DISTRIBUTION
+
+    def test_ny_sweep_of_london_low_sets_long(self, monkeypatch):
+        monkeypatch.setenv("PRISM_SESSION_DISPLACEMENT_PIPS", "10")
+        ref = date(2026, 5, 19)
+        engine = SessionBiasEngine("XAUUSD")
+
+        london_bars = []
+        for i in range(48):
+            total_min = 7 * 60 + i * 5
+            h, m = divmod(total_min, 60)
+            dt = datetime(ref.year, ref.month, ref.day, h, m, tzinfo=timezone.utc)
+            mid = 3250.0
+            price = mid + 10 * np.sin(2 * np.pi * i / 48)
+            london_bars.append({
+                "dt": dt,
+                "open": round(price - 0.5, 2),
+                "high": round(price + 1.0, 2),
+                "low": round(price - 1.0, 2),
+                "close": round(price + 0.3, 2),
+            })
+
+        engine.load_accumulation_range(_m5_bars(london_bars), ref_date=ref,
+                                       force_session="NY")
+        ar = engine.accumulation_range
+
+        ny_bars = london_bars + [
+            {"dt": datetime(2026, 5, 19, 14, 0, tzinfo=timezone.utc),
+             "open": ar.low + 1.0, "high": ar.low + 2.0,
+             "low": ar.low - 5.0, "close": ar.low + 0.5},
+            {"dt": datetime(2026, 5, 19, 14, 5, tzinfo=timezone.utc),
+             "open": ar.low + 0.5, "high": ar.low + 7.0,
+             "low": ar.low + 0.2, "close": ar.low + 6.0},
+        ]
+        bias = engine.update(_m5_bars(ny_bars))
+
+        assert bias.sweep_confirmed is True
+        assert bias.sweep_side == "LOW"
+        assert bias.direction == "LONG"
+        assert bias.displacement_confirmed is True
+
+    def test_session_resets_on_london_to_ny_transition(self):
+        """Engine resets sweep state when transitioning from London to NY."""
+        ref = date(2026, 5, 19)
+        engine = SessionBiasEngine("XAUUSD")
+
+        # First load as London
+        asian_bars = _asian_bars(ref, n=20)
+        engine.load_accumulation_range(_m5_bars(asian_bars), ref_date=ref,
+                                       force_session="LONDON")
+        assert engine._active_session == "LONDON"
+
+        # Transition to NY
+        london_bars = _london_bars(ref, n=20)
+        engine.load_accumulation_range(_m5_bars(london_bars), ref_date=ref,
+                                       force_session="NY")
+        assert engine._active_session == "NY"
+        assert engine._sweep_confirmed is False  # reset on transition

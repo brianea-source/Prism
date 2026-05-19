@@ -131,16 +131,15 @@ class SignalGenerator:
         4. ML confidence — threshold varies by session quality
         5. News bias — soft penalty
         6. FVG entry trigger
-        7. Sweep confirmation on entry TF
-        8. SL/TP + RR check
+        7. SL/TP + RR check
         """
         self.last_rejection_gate = None
 
         # --- Layer 0: Session Quality (LRF) ---
         news_signal = self.news.get_signal(self.instrument)
 
-        self.session_bias_engine.load_asian_range(entry_df)
-        asian_range = self.session_bias_engine.asian_range
+        self.session_bias_engine.load_accumulation_range(entry_df)
+        asian_range = self.session_bias_engine.accumulation_range
 
         sq = score_session(
             news_signal=news_signal,
@@ -272,23 +271,7 @@ class SignalGenerator:
             logger.debug("Price not in active FVG zone — no entry")
             return None
 
-        # --- Layer 6: Sweep confirmation on entry TF ---
-        try:
-            self.sweep_detector.detect(entry_df)
-            has_recent = self.sweep_detector.has_recent_sweep(
-                direction_str, bars_back=10, require_displacement=True,
-            )
-        except Exception as exc:
-            self.detector_failure_counts["sweep"] += 1
-            logger.error("SweepDetector failed: %s", exc, exc_info=True)
-            has_recent = False
-
-        if not has_recent:
-            self.last_rejection_gate = "sweep_confirmation"
-            logger.debug("No recent confirming sweep on entry TF")
-            return None
-
-        # --- Layer 7: SL/TP Calculation ---
+        # --- Layer 6: SL/TP Calculation ---
         # Anchor SL beyond the swept Asian extreme for a clean invalidation.
         icc_mock = {
             "correction_low": session_bias.asian_range.low if asian_range else 0,

@@ -175,7 +175,7 @@ class TestSessionPo3Flow:
         monkeypatch.setenv("PRISM_SMART_MONEY_ENABLED", "0")
 
     def _make_generator(self, monkeypatch, news=None, predictor=None,
-                        fvg_zone=None, sweep_recent=True):
+                        fvg_zone=None):
         from prism.signal.generator import SignalGenerator
         gen = SignalGenerator("XAUUSD")
         gen.news = MagicMock()
@@ -184,9 +184,6 @@ class TestSessionPo3Flow:
         gen._predictor = predictor or _mock_predictor()
         gen.fvg = MagicMock()
         gen.fvg.check_entry_trigger.return_value = fvg_zone
-        gen.sweep_detector = MagicMock()
-        gen.sweep_detector.detect.return_value = []
-        gen.sweep_detector.has_recent_sweep.return_value = sweep_recent
         return gen
 
     def test_low_sweep_fires_long(self, monkeypatch):
@@ -273,19 +270,6 @@ class TestSessionPo3Flow:
         signal = gen.generate(_build_h4_df(), _build_h1_df(), entry_df)
         assert signal is None
         assert gen.last_rejection_gate == "fvg_entry"
-
-    def test_no_entry_tf_sweep_blocks(self, monkeypatch):
-        """Session sweep OK, but no confirming sweep on entry TF → blocked."""
-        entry_df = _full_m5_with_sweep("LOW")
-        gen = self._make_generator(
-            monkeypatch,
-            fvg_zone=_mock_fvg("LONG"),
-            sweep_recent=False,
-        )
-
-        signal = gen.generate(_build_h4_df(), _build_h1_df(), entry_df)
-        assert signal is None
-        assert gen.last_rejection_gate == "sweep_confirmation"
 
     def test_low_ml_confidence_blocks(self, monkeypatch):
         """ML confidence too low + session blending → below threshold."""
