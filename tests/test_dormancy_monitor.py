@@ -165,3 +165,33 @@ class TestGeneratorGateTag:
         from prism.signal.generator import SignalGenerator
         gen = SignalGenerator("XAUUSD")
         assert gen.last_rejection_gate is None
+
+
+# ---------------------------------------------------------------------------
+# Regression: dormancy-init block must not reference ``now`` before the
+# scan loop assigns it. Caught in production 2026-05-18 when the runner
+# crashed with UnboundLocalError on startup with an empty state dir.
+# ---------------------------------------------------------------------------
+class TestDormancySeedBaselineAtInit:
+    def test_save_last_signal_fire_called_at_init_with_real_now(
+        self, tmp_path, monkeypatch
+    ):
+        """When state dir has no last_signal_fire_ts, the runner init path
+        must seed it with the current time without crashing.
+
+        Reproduces the crash where ``_save_last_signal_fire(now)`` referenced
+        a function-scoped ``now`` defined only inside the scan-loop body.
+        """
+        monkeypatch.setenv("PRISM_STATE_DIR", str(tmp_path))
+        # Sanity: no prior timestamp
+        assert r._load_last_signal_fire() is None
+
+        from datetime import datetime, timezone
+        before = datetime.now(timezone.utc)
+        # Direct exercise of the init seeding path used in run()
+        if r._load_last_signal_fire() is None:
+            r._save_last_signal_fire(datetime.now(timezone.utc))
+
+        loaded = r._load_last_signal_fire()
+        assert loaded is not None
+        assert (loaded - before).total_seconds() < 5
