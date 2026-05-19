@@ -1,17 +1,22 @@
 """
 PRISM Signal Generator — orchestrates all layers into a complete signal.
 
-Structure-first flow (PRISM_STRUCTURE_FIRST=1, default):
-1. Layer 0: News check (block if high-impact event inside blackout window)
-2. Layer 1: HTF bias (1H + 4H swing structure) → determines allowed direction
-3. Layer 2: ICC pattern (H1 structure) → finds CONTINUATION setup, confirms direction
-4. Layer 3: ML model → provides confidence + magnitude scoring (not direction)
-5. Layer 4: FVG zone with M5 break-and-retest confirmation
-6. Layer 5: SL/TP calculation
-7. Output: SignalPacket ready for execution
+Session Po3 flow (PRISM_SESSION_PO3=1):
+1. Layer 0: Session Quality (LRF score) — skip / cautious / favorable
+2. Layer 1: Session Po3 bias — Asian sweep sets direction
+3. Layer 2: HTF context — confidence modifier, not a gate
+4. Layer 3: ML confidence — threshold varies by session quality
+5. Layer 4: News bias — soft confidence penalty
+6. Layer 5: FVG entry trigger
+7. Layer 6: Sweep confirmation (required)
+8. Layer 7: SL/TP calculation
+9. Output: SignalPacket ready for execution
 
-Market structure determines direction. ML scores the setup.
-News bias adjusts confidence, it does not veto the trade.
+Structure-first flow (PRISM_STRUCTURE_FIRST=1, default fallback):
+1-7: HTF bias → ICC → ML → FVG → SL/TP (see _generate_structure_first)
+
+Session Po3 determines direction from the daily manipulation sweep.
+ML scores the setup. HTF and news adjust confidence.
 
 This module runs on every new M5/M15 bar.
 """
@@ -28,6 +33,8 @@ from prism.signal.icc import ICCDetector
 from prism.signal.htf_bias import HTFBiasEngine
 from prism.signal.order_blocks import OrderBlockDetector
 from prism.signal.po3 import Po3Detector
+from prism.signal.session_bias import SessionBiasEngine, SessionPhase
+from prism.signal.session_quality import score_session, SessionGrade
 from prism.signal.sweeps import SweepDetector
 from prism.signal.quality_filter import apply_quality_filter
 from prism.delivery.session_filter import is_kill_zone, session_label
@@ -71,11 +78,7 @@ class SignalGenerator:
         self.ob_detector = OrderBlockDetector(instrument, "H4")
         self.sweep_detector = SweepDetector(instrument)
         self.po3_detector = Po3Detector(instrument)
-        # Per-detector failure counters (Phase 6.E). Bumped whenever a smart-money
-        # detector raises during ``_evaluate_smart_money``. Surfaced to ops via
-        # logger.error + traceback; expose here so a future metrics layer can read
-        # ``gen.detector_failure_counts`` without touching the log pipeline. Keys
-        # are stable: ``ob`` / ``sweep`` / ``po3``.
+        self.session_bias_engine = SessionBiasEngine(instrument)
         self.detector_failure_counts: dict[str, int] = {
             "ob": 0, "sweep": 0, "po3": 0,
         }
@@ -98,12 +101,239 @@ class SignalGenerator:
     ) -> Optional[SignalPacket]:
         """Run all layers and return SignalPacket if conditions are met.
 
-        Dispatches to the structure-first flow (default) or legacy
-        ML-direction flow based on ``PRISM_STRUCTURE_FIRST`` env var.
+        Dispatch priority:
+        1. PRISM_SESSION_PO3=1 → session-level Po3 (Asian sweep → direction)
+        2. PRISM_STRUCTURE_FIRST=1 → HTF+ICC structure-first (default fallback)
+        3. Legacy ML-direction flow
         """
+        if _env_bool("PRISM_SESSION_PO3", "0"):
+            return self._generate_session_po3(h4_df, h1_df, entry_df)
         if _env_bool("PRISM_STRUCTURE_FIRST", "1"):
             return self._generate_structure_first(h4_df, h1_df, entry_df)
         return self._generate_legacy(h4_df, h1_df, entry_df)
+
+    # ------------------------------------------------------------------
+    # Session Po3 flow (PRISM_SESSION_PO3=1)
+    # ------------------------------------------------------------------
+
+    def _generate_session_po3(
+        self,
+        h4_df: pd.DataFrame,
+        h1_df: pd.DataFrame,
+        entry_df: pd.DataFrame,
+    ) -> Optional[SignalPacket]:
+        """Daily Po3 cycle determines direction from the Asian session sweep.
+
+        Flow:
+        1. Session Quality (LRF) — graduated scoring, not binary
+        2. Session Po3 bias — Asian range → sweep → direction
+        3. HTF context — confidence modifier, not a hard gate
+        4. ML confidence — threshold varies by session quality
+        5. News bias — soft penalty
+        6. FVG entry trigger
+        7. SL/TP + RR check
+        """
+        self.last_rejection_gate = None
+
+        # --- Layer 0: Session Quality (LRF) ---
+        news_signal = self.news.get_signal(self.instrument)
+
+        self.session_bias_engine.load_accumulation_range(entry_df)
+        asian_range = self.session_bias_engine.accumulation_range
+
+        sq = score_session(
+            news_signal=news_signal,
+            asian_range=asian_range,
+        )
+
+        if sq.grade == SessionGrade.SKIP:
+            self.last_rejection_gate = "session_quality"
+            logger.info(
+                "Session quality SKIP (score=%d): %s",
+                sq.score, "; ".join(sq.reasons),
+            )
+            return None
+
+        # --- Layer 1: Session Po3 bias (primary direction setter) ---
+        session_bias = self.session_bias_engine.update(entry_df)
+
+        if session_bias.direction is None:
+            self.last_rejection_gate = "session_po3_no_sweep"
+            logger.debug(
+                "Session Po3: phase=%s, no sweep yet — waiting",
+                session_bias.phase.value,
+            )
+            return None
+
+        if not session_bias.displacement_confirmed:
+            self.last_rejection_gate = "session_po3_no_displacement"
+            logger.debug(
+                "Session Po3: sweep %s confirmed but no displacement yet",
+                session_bias.sweep_side,
+            )
+            return None
+
+        direction_str = session_bias.direction  # "LONG" or "SHORT"
+        confidence = 0.70  # base confidence for session-Po3 trades
+
+        # --- Layer 2: HTF context (confidence modifier, NOT a gate) ---
+        htf_result = self.htf_engine.refresh(h1_df, h4_df)
+        htf_bonus = _env_float("PRISM_HTF_AGREE_BONUS", 0.05)
+        htf_penalty = _env_float("PRISM_HTF_DISAGREE_PENALTY", 0.10)
+
+        if htf_result.aligned and htf_result.allowed_direction is not None:
+            if htf_result.allowed_direction == direction_str:
+                confidence += htf_bonus
+                logger.debug(
+                    "HTF agrees with session Po3 (%s) — confidence +%.0f%%",
+                    direction_str, htf_bonus * 100,
+                )
+            else:
+                confidence -= htf_penalty
+                logger.info(
+                    "HTF (%s) disagrees with session Po3 (%s) — "
+                    "confidence -%.0f%%",
+                    htf_result.allowed_direction, direction_str,
+                    htf_penalty * 100,
+                )
+        # HTF ranging = no modifier (neutral)
+
+        # --- Layer 3: ML confidence ---
+        if self._predictor is None:
+            self._load_predictor()
+
+        feature_cols = [
+            c for c in h4_df.columns
+            if c not in ["datetime", "open", "high", "low", "close", "volume",
+                         "direction_fwd_4", "magnitude_pips"]
+        ]
+        if not feature_cols:
+            self.last_rejection_gate = "no_features"
+            logger.warning("No feature columns found in H4 data")
+            return None
+
+        latest_features = h4_df[feature_cols].iloc[[-1]]
+        prediction = self._predictor.predict_latest(latest_features)
+        ml_confidence = float(prediction["confidence"])
+        ml_direction = prediction["direction_str"]
+
+        # Blend session base confidence with ML confidence.
+        # Session Po3 provides the base (sweep quality); ML adjusts.
+        confidence = (confidence + ml_confidence) / 2.0
+
+        if confidence < sq.min_confidence:
+            self.last_rejection_gate = "ml_confidence"
+            logger.debug(
+                "Blended confidence %.2f below session threshold %.2f",
+                confidence, sq.min_confidence,
+            )
+            return None
+
+        if ml_direction != direction_str:
+            logger.info(
+                "ML predicted %s but session Po3 says %s — trading with "
+                "session structure (confidence=%.2f)",
+                ml_direction, direction_str, confidence,
+            )
+
+        # --- Layer 4: News bias (soft penalty) ---
+        news_penalty = _env_float("PRISM_NEWS_BIAS_PENALTY", 0.10)
+        if news_signal.news_bias != "NEUTRAL":
+            bias_agrees = (
+                (direction_str == "LONG" and news_signal.news_bias == "BULLISH") or
+                (direction_str == "SHORT" and news_signal.news_bias == "BEARISH")
+            )
+            if not bias_agrees:
+                confidence = max(0.0, confidence - news_penalty)
+                logger.info(
+                    "News bias (%s) opposes session Po3 (%s) — "
+                    "confidence reduced to %.2f",
+                    news_signal.news_bias, direction_str, confidence,
+                )
+                if confidence < sq.min_confidence:
+                    self.last_rejection_gate = "news_bias_penalty"
+                    return None
+
+        # --- Layer 5: FVG Entry ---
+        self.fvg.detect(h4_df)
+        if self.persist_fvg:
+            try:
+                self.fvg.save()
+            except Exception as e:
+                logger.warning("FVG save failed: %s", e)
+        current_price = float(entry_df["close"].iloc[-1])
+        fvg_zone = self.fvg.check_entry_trigger(
+            current_price, direction_str, m5_df=entry_df,
+        )
+
+        if fvg_zone is None:
+            self.last_rejection_gate = "fvg_entry"
+            logger.debug("Price not in active FVG zone — no entry")
+            return None
+
+        # --- Layer 6: SL/TP Calculation ---
+        # Anchor SL beyond the swept Asian extreme for a clean invalidation.
+        icc_mock = {
+            "correction_low": session_bias.asian_range.low if asian_range else 0,
+            "correction_high": session_bias.asian_range.high if asian_range else 0,
+            "leg_size": (
+                session_bias.asian_range.range_pips *
+                PIP_SIZE.get(self.instrument, 0.0001) * 2
+            ) if asian_range else 0,
+        }
+        entry, sl, tp1, tp2, rr = self._calculate_levels(
+            entry_df, direction_str, icc_mock, fvg_zone,
+        )
+        if rr < MIN_RR:
+            self.last_rejection_gate = "rr_ratio"
+            logger.info("RR too low: %.2f < %.1f — no trade", rr, MIN_RR)
+            return None
+
+        logger.info(
+            "SIGNAL [Session Po3]: %s %s | entry=%s sl=%s tp1=%s tp2=%s "
+            "rr=%.2f conf=%.2f sweep=%s phase=%s",
+            self.instrument, direction_str, entry, sl, tp1, tp2, rr,
+            confidence, session_bias.sweep_side, session_bias.phase.value,
+        )
+
+        packet = SignalPacket(
+            instrument=self.instrument,
+            direction=direction_str,
+            entry=entry,
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            rr_ratio=rr,
+            confidence=confidence,
+            confidence_level=prediction["confidence_level"],
+            magnitude_pips=prediction["magnitude_pips"],
+            regime=news_signal.risk_regime,
+            news_bias=news_signal.news_bias,
+            fvg_zone=vars(fvg_zone),
+            signal_time=datetime.now(timezone.utc).isoformat(),
+            htf_bias={
+                "bias_1h": htf_result.bias_1h.value,
+                "bias_4h": htf_result.bias_4h.value,
+                "aligned": htf_result.aligned,
+                "allowed_direction": htf_result.allowed_direction,
+                "role": "context_modifier",
+            },
+            smart_money={
+                "session_po3": {
+                    "phase": session_bias.phase.value,
+                    "sweep_side": session_bias.sweep_side,
+                    "sweep_price": session_bias.sweep_price,
+                    "asian_high": asian_range.high if asian_range else None,
+                    "asian_low": asian_range.low if asian_range else None,
+                    "asian_range_pips": asian_range.range_pips if asian_range else None,
+                },
+                "session_quality": {
+                    "score": sq.score,
+                    "grade": sq.grade.value,
+                },
+            },
+        )
+        return packet
 
     # ------------------------------------------------------------------
     # Structure-first flow (new default)
