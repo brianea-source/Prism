@@ -18,8 +18,10 @@ Sunday-open gap:
   outside London/NY).
 """
 import os
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
+
+import pandas as pd
 
 
 class Session(str, Enum):
@@ -36,6 +38,28 @@ NY_START = time(13, 0)
 NY_END = time(17, 0)
 ASIAN_START = time(0, 0)
 ASIAN_END = time(6, 0)
+
+
+def asian_session_bars(df: pd.DataFrame, ref_date: date = None) -> pd.DataFrame:
+    """Return rows from ``df`` that fall within today's Asian session (00:00–06:00 UTC).
+
+    ``df`` must have a ``datetime`` column (or DatetimeIndex) with tz-aware
+    timestamps. If ``ref_date`` is None the current UTC date is used.
+    """
+    if ref_date is None:
+        ref_date = datetime.now(timezone.utc).date()
+    start = datetime(ref_date.year, ref_date.month, ref_date.day, 0, 0, tzinfo=timezone.utc)
+    end = datetime(ref_date.year, ref_date.month, ref_date.day, 6, 0, tzinfo=timezone.utc)
+
+    if isinstance(df.index, pd.DatetimeIndex):
+        ts = df.index.tz_convert(timezone.utc) if df.index.tz is not None else df.index.tz_localize(timezone.utc)
+        mask = (ts >= start) & (ts < end)
+    elif "datetime" in df.columns:
+        col = pd.to_datetime(df["datetime"], utc=True)
+        mask = (col >= start) & (col < end)
+    else:
+        return df.iloc[0:0]
+    return df.loc[mask]
 
 
 def get_current_session(dt: datetime = None) -> Session:
